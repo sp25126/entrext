@@ -9,8 +9,8 @@ export class LLMClient {
 
     async complete(messages, onProgress) {
         // In the extension, we route through the background.js fetch
-        // For simplicity in this module, we implement the fetch logic directly
-        const groqKey = "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"; // Provided in history
+        // API Key should be loaded from chrome.storage or env
+        const groqKey = ""; // TODO: Load from chrome.storage.local
         
         try {
             const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
