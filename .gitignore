@@ -1,0 +1,35 @@
+# --- OS Files ---
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+
+# --- Next.js / Node ---
+web/node_modules/
+web/.next/
+web/out/
+web/build/
+web/.env.local
+web/.env.production
+web/.env
+
+# --- FastAPI / Python ---
+backend/venv/
+backend/.env
+backend/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/*.pyd
+backend/.pytest_cache/
+backend/.coverage
+backend/htmlcov/
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# --- Assets ---
+web/public/screenshots/
+backend/screenshots/
