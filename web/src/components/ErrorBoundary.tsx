@@ -1,60 +1,48 @@
-'use client';
-
-import React, { Component, ErrorInfo, ReactNode } from 'react';
-import { AlertTriangle, RotateCcw } from 'lucide-react';
-import { Button } from './ui/button';
+'use client'
+import React from 'react'
 
 interface Props {
-  children?: ReactNode;
+  children: React.ReactNode
+  fallback?: React.ReactNode
 }
 
 interface State {
-  hasError: boolean;
-  error?: Error;
+  hasError: boolean
+  error: Error | null
 }
 
-export class ErrorBoundary extends Component<Props, State> {
-  public state: State = {
-    hasError: false
-  };
+export class ErrorBoundary extends React.Component<Props, State> {
+  state: State = { hasError: false, error: null }
 
-  public static getDerivedStateFromError(error: Error): State {
-    return { hasError: true, error };
+  static getDerivedStateFromError(error: Error): State {
+    return { hasError: true, error }
   }
 
-  public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error('CRITICAL_UI_FAILURE:', error, errorInfo);
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error('[Entrext ErrorBoundary]', error, info.componentStack)
   }
 
-  public render() {
+  render() {
     if (this.state.hasError) {
-      return (
-        <div className="flex flex-col items-center justify-center min-h-[400px] p-8 bg-[#09090b] rounded-[32px] border border-rose-500/20 text-center">
-          <div className="w-16 h-16 rounded-full bg-rose-500/10 flex items-center justify-center mb-6">
-            <AlertTriangle className="w-8 h-8 text-rose-500" />
+      return this.props.fallback ?? (
+        <div className="flex items-center justify-center p-8 bg-[#1a1a1f] border border-white/5 rounded-3xl text-white/50 text-sm flex-col gap-4 text-center">
+          <div className="w-12 h-12 rounded-full bg-rose-500/10 flex items-center justify-center text-rose-500 text-2xl">
+            ⚠️
           </div>
-          <h2 className="text-xl font-black text-white tracking-tight mb-2">Interface Engine Failure</h2>
-          <p className="text-xs text-white/40 mb-6 max-w-xs mx-auto leading-relaxed">
-            The auditing engine encountered a critical render error. This has been logged for system recovery.
-          </p>
-          
-          <div className="w-full max-w-md p-4 bg-black/40 rounded-xl border border-white/5 mb-8 text-left overflow-hidden">
-             <p className="text-[10px] font-mono text-rose-400 opacity-60 break-all">
-                {this.state.error?.message || 'UNKNOWN_RUNTIME_EXCEPTION'}
-             </p>
+          <div>
+            <p className="font-black tracking-tight text-white mb-1">AUDIT ENGINE INTERRUPTED</p>
+            <p className="text-[10px] uppercase tracking-widest opacity-60">A component crash was contained.</p>
           </div>
-
-          <Button 
-            onClick={() => window.location.reload()}
-            className="bg-white text-black hover:bg-white/90 font-black text-[10px] tracking-widest px-8"
+          <button 
+            onClick={() => this.setState({ hasError: false, error: null })}
+            className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs transition-all shadow-xl shadow-purple-900/20"
           >
-            <RotateCcw className="w-3.5 h-3.5 mr-2" />
-            REINITIALIZE ENGINE
-          </Button>
+            Restart Pipeline
+          </button>
         </div>
-      );
+      )
     }
 
-    return this.props.children;
+    return this.props.children
   }
 }

@@ -2,123 +2,177 @@
 
 import React, { useState, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { MessageSquare, Check, Sparkles, Activity, Code, Lightbulb, ChevronDown, ChevronUp } from 'lucide-react'
+import { MessageSquare, Check, Sparkles, Activity, Code, Lightbulb, ChevronDown, ChevronUp, AlertCircle, X, Send } from 'lucide-react'
 import { useCommentStore } from '@/store/commentStore'
 import { useRealtimeStore } from '@/store/realtimeStore'
 import { useOverlayStore } from '@/store/overlayStore'
 import { useProjectStore } from '@/store/projectStore'
 import { Button } from '@/components/ui/button'
-import { X, Send } from 'lucide-react'
+import { SessionReplay } from './SessionReplay'
 
-const SeverityBadge = ({ severity, isAnalyzing }: { severity?: string, isAnalyzing?: boolean }) => {
-  if (isAnalyzing) {
-    return (
-      <div className="flex items-center gap-1.5 px-2 py-1 rounded-full bg-white/5 border border-white/10 animate-pulse">
-        <div className="w-1.5 h-1.5 rounded-full bg-white/20" />
-        <span className="text-[8px] font-black tracking-widest text-white/20 uppercase">Analyzing...</span>
-      </div>
-    )
-  }
-  
-  const colors: any = {
-    P0: 'bg-rose-500 shadow-[0_0_12px_#f43f5e]',
-    P1: 'bg-orange-500 shadow-[0_0_12px_#f97316]',
-    P2: 'bg-yellow-500 shadow-[0_0_12px_#eab308]',
-    P3: 'bg-slate-500 shadow-[0_0_12px_#64748b]'
-  }
-  
-  return (
-    <div className={`px-2 py-0.5 rounded-full text-[8px] font-black text-white uppercase tracking-widest ${colors[severity || 'P3']}`}>
-      {severity || 'P3'}
-    </div>
-  )
+const SEVERITY_STYLES: any = {
+  P0: 'bg-rose-500/20 text-rose-400 border border-rose-500/30 shadow-[0_0_12px_rgba(244,63,94,0.2)]',
+  P1: 'bg-orange-500/20 text-orange-400 border border-orange-500/30',
+  P2: 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30',
+  P3: 'bg-slate-500/20 text-slate-400 border border-slate-500/30',
 }
 
 const CommentCard = React.memo(({ comment, index }: { comment: any, index: number }) => {
-  const [showFix, setShowFix] = useState(false)
+  const [expanded, setExpanded] = useState(false)
+  const [showSession, setShowSession] = useState(false)
   const resolveComment = useCommentStore(state => state.resolveComment)
   
-  const isAnalyzing = !comment.severity && comment.status === 'saving';
+  const isResolved = comment.status === 'resolved'
+  const isAnalyzing = !comment.severity && comment.status === 'saving'
 
   return (
     <motion.div 
       layout
       initial={{ opacity: 0, x: 20 }}
-      animate={{ opacity: 1, x: 0 }}
-      className={`group relative m-2 p-5 rounded-2xl bg-[#1a1a1f] border border-white/[0.03] transition-all hover:border-white/10 ${comment.status === 'resolved' ? 'opacity-40 grayscale pointer-events-none' : ''}`}
+      animate={{ opacity: isResolved ? 0.4 : 1, x: 0 }}
+      className={`group relative m-2 p-5 rounded-3xl transition-all ${
+        isResolved ? 'bg-white/[0.02] border border-white/5 opacity-40 grayscale pointer-events-none' : 'bg-[#1a1a1f] border border-white/[0.03] hover:border-white/10'
+      }`}
     >
       {/* Resolved Strikethrough Effect */}
-      {comment.status === 'resolved' && (
-        <motion.div initial={{ width: 0 }} animate={{ width: '100% '}} className="absolute top-1/2 left-0 h-[2px] bg-white/20 z-10" />
+      {isResolved && (
+        <motion.div initial={{ width: 0 }} animate={{ width: '100%' }} className="absolute top-1/2 left-0 h-[1px] bg-white/20 z-10" />
       )}
 
-      <div className="flex items-center justify-between mb-3">
+      {/* Header row */}
+      <div className="flex items-start justify-between gap-4 mb-4">
         <div className="flex items-center gap-3">
-           <SeverityBadge severity={comment.severity} isAnalyzing={isAnalyzing} />
-           <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white/5 border border-white/5">
-              <Code className="w-3 h-3 text-cyan-400" />
-              <code className="text-[9px] font-mono text-cyan-400/80">{comment.component_selector || '#viewport'}</code>
-           </div>
-        </div>
-        <span className="text-[9px] font-black text-white/10 tracking-widest">#{index + 1}</span>
-      </div>
-
-      {comment.ai_summary && (
-        <p className="text-[11px] font-black text-white mb-1 tracking-tight leading-tight">{comment.ai_summary}</p>
-      )}
-      <p className="text-xs text-white/50 mb-3 leading-relaxed">{comment.text}</p>
-
-      {comment.screenshot_url && (
-        <div className="mb-3 rounded-xl overflow-hidden border border-white/5 bg-black/20 group-hover:border-white/20 transition-all">
-           <img 
-             src={comment.screenshot_url} 
-             loading="lazy" 
-             className="w-full h-20 object-cover opacity-60 hover:h-auto hover:opacity-100 transition-all duration-500 cursor-zoom-in" 
-           />
-        </div>
-      )}
-
-      <div className="flex items-center justify-between mt-4">
-         <div className="flex items-center gap-2">
-            <div className="w-5 h-5 rounded-full bg-white/5 flex items-center justify-center">
-               <Activity className="w-3 h-3 text-white/20" />
+          {/* Marker number */}
+          <div className="w-6 h-6 rounded-xl bg-purple-600 flex items-center justify-center text-[10px] font-black text-white flex-shrink-0 shadow-lg shadow-purple-900/40">
+            {index + 1}
+          </div>
+          
+          {/* Severity badge or shimmer */}
+          {comment.severity ? (
+            <span className={`text-[9px] px-2 py-0.5 rounded-full font-black uppercase tracking-widest ${SEVERITY_STYLES[comment.severity] ?? SEVERITY_STYLES.P3}`}>
+              {comment.severity}
+            </span>
+          ) : (
+            <div className="flex items-center gap-2 px-2 py-1 rounded-full bg-white/5 border border-white/10 animate-pulse">
+                <div className="w-1.5 h-1.5 rounded-full bg-white/20" />
+                <span className="text-[8px] font-black tracking-widest text-white/20 uppercase">Analyzing...</span>
             </div>
-            <span className="text-[9px] font-bold text-white/20 uppercase tracking-widest">{comment.author_name}</span>
-         </div>
-         
-         <div className="flex items-center gap-2">
-           {comment.suggested_fix && (
-             <button 
-               onClick={() => setShowFix(!showFix)}
-               className="p-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20 transition-all"
-             >
-               <Lightbulb className="w-3.5 h-3.5" />
-             </button>
-           )}
-           <button 
-             onClick={() => resolveComment(comment.id)}
-             className="p-1.5 rounded-lg bg-green-500/10 text-green-400 hover:bg-green-500/20 transition-all font-black text-[9px] tracking-widest"
-           >
-             RESOLVE
-           </button>
-         </div>
+          )}
+
+          {/* Design system violation flag */}
+          {comment.session_data?.designViolations?.length > 0 && (
+            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-rose-500/10 border border-rose-500/20 group/ds cursor-help">
+                <AlertCircle className="w-3 h-3 text-rose-400" />
+                <span className="text-[8px] font-black text-rose-400 uppercase tracking-widest">DS Violation</span>
+                {/* Tooltip */}
+                <div className="absolute top-10 left-0 w-64 p-3 bg-black border border-white/10 rounded-xl opacity-0 group-hover/ds:opacity-100 transition-all z-50 pointer-events-none text-[9px] text-white/60 leading-relaxed font-mono">
+                    {comment.session_data.designViolations[0].message}
+                </div>
+            </div>
+          )}
+        </div>
+        <span className="text-white/10 text-[9px] font-black uppercase tracking-widest mt-1">
+          {new Date(comment.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+        </span>
       </div>
 
-      <AnimatePresence>
-        {showFix && (
-          <motion.div 
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            className="mt-3 p-3 rounded-xl bg-cyan-500/5 border border-cyan-500/10"
+      {/* AI summary (bold) + raw text */}
+      {comment.ai_summary && (
+        <h4 className="text-[11px] font-black text-white mb-1.5 tracking-tight leading-tight uppercase group-hover:text-cyan-400 transition-colors">{comment.ai_summary}</h4>
+      )}
+      <p className={`text-xs text-white/50 leading-relaxed ${isResolved ? 'line-through' : ''}`}>
+        {comment.text}
+      </p>
+
+      {/* Selector chip */}
+      <div className="mt-4 flex items-center gap-2 flex-wrap">
+        <div className="flex items-center gap-2 px-2 py-1 rounded-md bg-white/5 border border-white/5">
+            <Code className="w-3 h-3 text-cyan-400" />
+            <code className="text-[9px] font-mono text-cyan-400/80">{comment.component_selector || '#viewport'}</code>
+        </div>
+        <span className="text-[9px] font-bold text-white/20 uppercase tracking-widest">{comment.tester_name}</span>
+      </div>
+
+      {/* Screenshot thumbnail */}
+      {comment.screenshot_url && (
+        <div className="mt-4 rounded-2xl overflow-hidden border border-white/5 bg-black/20 group/img relative">
+           <img
+             src={comment.screenshot_url}
+             alt="Element screenshot"
+             className={`w-full h-20 object-cover cursor-zoom-in transition-all duration-500 ${expanded ? 'h-auto opacity-100' : 'opacity-40 group-hover:opacity-100'}`}
+             loading="lazy"
+             onClick={() => setExpanded(!expanded)}
+           />
+           {!expanded && <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/img:opacity-100 pointer-events-none transition-all">
+                <span className="text-[8px] font-black text-white px-3 py-1 bg-black/50 backdrop-blur-md rounded-full tracking-widest border border-white/10">EXPAND CONTEXT</span>
+           </div>}
+        </div>
+      )}
+
+      {/* Suggested fix */}
+      {comment.suggested_fix && (
+        <div className="mt-4 p-3 rounded-2xl bg-cyan-500/5 border border-cyan-500/10">
+          <div className="flex items-center gap-2 mb-2">
+            <Lightbulb className="w-3 h-3 text-cyan-400" />
+            <span className="text-[9px] font-black text-cyan-400 uppercase tracking-widest">AI Intelligence</span>
+          </div>
+          <p className="text-[10px] text-white/50 italic leading-relaxed">"{comment.suggested_fix}"</p>
+        </div>
+      )}
+
+      {/* Session replay toggle */}
+      {comment.session_data && (
+        <div className="mt-4">
+          <button 
+            onClick={() => setShowSession(!showSession)}
+            className="flex items-center gap-2 text-[9px] font-black text-white/20 hover:text-white transition-all uppercase tracking-widest"
           >
-            <p className="text-[10px] text-cyan-400/80 italic">" {comment.suggested_fix} "</p>
-          </motion.div>
-        )}
-      </AnimatePresence>
+            <Activity className="w-3.5 h-3.5" />
+            {showSession ? 'Hide Narrative' : 'Replay User Narrative'}
+            {showSession ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+          </button>
+          
+          <AnimatePresence>
+            {showSession && (
+                <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    className="overflow-hidden"
+                >
+                    <div className="pt-4">
+                        <SessionReplay sessionData={comment.session_data} />
+                    </div>
+                </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      )}
+
+      {/* Actions */}
+      {!isResolved && (
+        <div className="mt-6 flex gap-2">
+            {comment.status === 'failed' && (
+                <button
+                    onClick={() => useCommentStore.getState().retryComment(comment.id)}
+                    className="flex-1 h-9 rounded-xl bg-rose-500/10 text-rose-400 text-[9px] font-black uppercase tracking-widest transition-all border border-rose-500/20 hover:bg-rose-500/20"
+                >
+                   ↻ Retry
+                </button>
+            )}
+            <button
+                onClick={() => resolveComment(comment.id)}
+                className="flex-1 h-9 rounded-xl bg-white/5 hover:bg-green-500/10 text-white/20 hover:text-green-400 text-[9px] font-black uppercase tracking-widest transition-all border border-transparent hover:border-green-500/20"
+            >
+                Authorize Resolution
+            </button>
+        </div>
+      )}
     </motion.div>
   )
 })
+
+import { GitHubExportPanel } from './GitHubExportPanel'
 
 export default function CommandCenter() {
   const { currentProject } = useProjectStore()
@@ -128,6 +182,7 @@ export default function CommandCenter() {
   const { pendingMarker, clearPending } = useOverlayStore()
 
   const [text, setText] = useState('')
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false)
   const [testerName, setTesterName] = useState(
     typeof window !== 'undefined' ? localStorage.getItem('tester_name') ?? '' : ''
   )
@@ -193,10 +248,31 @@ export default function CommandCenter() {
          </div>
       </div>
 
-      <div className="p-6">
-        <h2 className="text-xl font-black tracking-tighter text-white">Command Center</h2>
-        <p className="text-[9px] font-bold text-white/20 uppercase tracking-[0.2em] mt-1">Audit Enrichment Stream</p>
+      <div className="p-6 flex items-center justify-between">
+        <div>
+          <h2 className="text-xl font-black tracking-tighter text-white">Command Center</h2>
+          <p className="text-[9px] font-bold text-white/20 uppercase tracking-[0.2em] mt-1">Audit Enrichment Stream</p>
+        </div>
+        <button 
+          onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+          className={`p-2 rounded-xl border transition-all ${isSettingsOpen ? 'bg-purple-600 border-purple-400 text-white shadow-lg shadow-purple-900/40' : 'bg-white/5 border-white/5 text-white/20 hover:text-white/40'}`}
+        >
+          <Activity className={`w-4 h-4 ${isSettingsOpen ? 'animate-spin-slow' : ''}`} />
+        </button>
       </div>
+
+      <AnimatePresence>
+        {isSettingsOpen && currentProject && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="overflow-hidden"
+          >
+            <GitHubExportPanel projectId={currentProject.id} />
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {pendingMarker && (
@@ -252,11 +328,11 @@ export default function CommandCenter() {
 
       <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar">
          {sortedComments.length > 0 ? (
-           <div className="p-2">
-             {sortedComments.map((comment, index) => (
-               <CommentCard key={comment.id} comment={comment} index={index} />
-             ))}
-           </div>
+            <div className="p-2 space-y-2">
+              {sortedComments.map((comment, index) => (
+                <CommentCard key={comment.id} comment={comment} index={index} />
+              ))}
+            </div>
          ) : (
            <div className="flex flex-col items-center justify-center h-full opacity-20 filter grayscale">
               <Sparkles className="w-12 h-12 mb-4" />

@@ -3,10 +3,12 @@ import { create } from 'zustand';
 interface UIState {
   isCommandCenterOpen: boolean;
   isExportPanelOpen: boolean;
+  isDesignSystemOpen: boolean;
   toasts: { id: string; message: string; type: 'success' | 'error' | 'info' }[];
   
   toggleCommandCenter: (open?: boolean) => void;
   toggleExportPanel: (open?: boolean) => void;
+  toggleDesignSystem: (open?: boolean) => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   removeToast: (id: string) => void;
 }
@@ -14,6 +16,7 @@ interface UIState {
 export const useUIStore = create<UIState>((set) => ({
   isCommandCenterOpen: true,
   isExportPanelOpen: false,
+  isDesignSystemOpen: false,
   toasts: [],
   
   toggleCommandCenter: (open) => set((state) => ({ 
@@ -21,6 +24,9 @@ export const useUIStore = create<UIState>((set) => ({
   })),
   toggleExportPanel: (open) => set((state) => ({ 
     isExportPanelOpen: open !== undefined ? open : !state.isExportPanelOpen 
+  })),
+  toggleDesignSystem: (open) => set((state) => ({
+    isDesignSystemOpen: open !== undefined ? open : !state.isDesignSystemOpen
   })),
   addToast: (message, type) => {
     const id = Math.random().toString(36).substr(2, 9);

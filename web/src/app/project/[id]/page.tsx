@@ -7,19 +7,14 @@ import { Button } from '@/components/ui/button'
 import { Marker } from '@/components/ui/Marker'
 import { ThemeToggle } from '@/components/ThemeToggle'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
-import { ExportOverlay } from '@/components/ExportOverlay'
+import { ExportPanel } from '@/components/ExportPanel'
+import { DesignSystemPanel } from '@/components/DesignSystemPanel'
 import { createClient } from '@/lib/supabase/client'
 import { AdvancedSiteCard } from '@/components/AdvancedSiteCard'
 import CommandCenter from '@/components/CommandCenter'
+import { Palette } from 'lucide-react'
 
-import { useProjectStore } from '@/store/projectStore'
-import { useCommentStore } from '@/store/commentStore'
-import { useOverlayStore } from '@/store/overlayStore'
-import { useRealtimeStore } from '@/store/realtimeStore'
-import { useUIStore } from '@/store/uiStore'
-import { env } from '@/lib/env'
-import { cn } from '@/lib/utils'
-import { motion, AnimatePresence } from 'framer-motion'
+import { useRealtimeSync } from '@/hooks/useRealtimeSync'
 
 export default function ProjectPage() {
   const params = useParams()
@@ -36,68 +31,34 @@ export default function ProjectPage() {
     error: projectError 
   } = useProjectStore()
   const { comments, fetchComments, error: commentError } = useCommentStore()
-  const { activeTesters, updateCursor, setConnected } = useRealtimeStore()
+  const { activeTesters, setConnected } = useRealtimeStore()
   const { markers, pendingMarker, setMode, addMarker } = useOverlayStore()
-  const { isCommandCenterOpen, isExportPanelOpen, toggleCommandCenter, toggleExportPanel } = useUIStore()
+  const { 
+    isCommandCenterOpen, 
+    isExportPanelOpen, 
+    isDesignSystemOpen,
+    toggleCommandCenter, 
+    toggleExportPanel,
+    toggleDesignSystem
+  } = useUIStore()
   
   const [proxyStatus, setProxyStatus] = useState<'loading' | 'ok' | 'advanced' | 'failed'>('loading')
   const iframeRef = useRef<HTMLIFrameElement>(null)
-
-  const wsRef = useRef<WebSocket | null>(null)
   const lastEmitRef = useRef(0)
+
+  // Handled by the industrial-grade sync hook
+  const wsRef = useRealtimeSync(id)
 
   // Initial Sync
   useEffect(() => {
     if (!id) return;
-    
-    // Fetch project and comments
     fetchProjects().then(() => {
       const allProjects = useProjectStore.getState().projects
       const found = allProjects.find(p => p.id === id)
-      if (found) {
-        setCurrentProject(found)
-      }
+      if (found) setCurrentProject(found)
       fetchComments(id);
     });
-
-    // WebSocket Orchestration
-    const setupRealtime = async () => {
-      // ✅ Anonymous Identity for MVP Demo
-      const tester_id = localStorage.getItem('tester_id') ?? (() => {
-        const id = crypto.randomUUID()
-        localStorage.setItem('tester_id', id)
-        return id
-      })()
-      const tester_name = localStorage.getItem('tester_name') ?? 'Anonymous'
-
-      const wsUrl = `${env.apiBase.replace('http', 'ws')}/ws/project/${id}?tester_id=${encodeURIComponent(tester_id)}&tester_name=${encodeURIComponent(tester_name)}`
-      const socket = new WebSocket(wsUrl)
-      wsRef.current = socket
-
-      socket.onopen = () => setConnected(true)
-      socket.onclose = () => setConnected(false)
-
-      socket.onmessage = (event) => {
-        const data = JSON.parse(event.data)
-        if (data.type === 'CURSOR_MOVE') {
-          updateCursor(data.user_id || data.sender_id, data.x, data.y, data.name || data.tester_name)
-        }
-        if (data.type === 'COMMENT_SAVED' || data.type === 'AI_UPDATE') {
-          fetchComments(id)
-        }
-      }
-    }
-
-    // Small delay before WS to ensure backend process is ready
-    const wsTimeout = setTimeout(() => {
-      setupRealtime()
-    }, 500)
-
-    return () => {
-      clearTimeout(wsTimeout)
-      wsRef.current?.close()
-    }
-  }, [id, fetchProjects, fetchComments, setConnected, updateCursor])
+  }, [id, fetchProjects, fetchComments, setCurrentProject])
 
   // Mouse Tracking
   const handleMouseMove = (e: React.MouseEvent) => {
@@ -134,6 +95,24 @@ export default function ProjectPage() {
 
     preflight()
   }, [currentProject?.target_url])
+
+  // Design System Synchronization to Iframe
+  useEffect(() => {
+    if (!currentProject?.design_system || !iframeRef.current) return
+    
+    const sync = () => {
+      iframeRef.current?.contentWindow?.postMessage({
+        type: 'DESIGN_SYSTEM_CONFIG',
+        config: currentProject.design_system
+      }, '*')
+    }
+
+    // Attempt sync on load and whenever config changes
+    sync()
+    const frame = iframeRef.current
+    frame.addEventListener('load', sync)
+    return () => frame.removeEventListener('load', sync)
+  }, [currentProject?.design_system])
 
   // Cross-Window Listener
   useEffect(() => {
@@ -188,11 +167,44 @@ export default function ProjectPage() {
   return (
     <ErrorBoundary>
       <div className="flex h-screen bg-transparent overflow-hidden font-sans antialiased">
-        <ExportOverlay 
-          isOpen={isExportPanelOpen} 
-          onClose={() => toggleExportPanel(false)}
-          markdown="# Audit Export In Progress"
-        />
+        <AnimatePresence>
+          {isExportPanelOpen && currentProject && (
+            <ExportPanel 
+              projectId={currentProject.id} 
+              projectName={currentProject.name}
+              commentCount={comments.length}
+              onClose={() => toggleExportPanel(false)}
+            />
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {isDesignSystemOpen && currentProject && (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-black/40 backdrop-blur-sm">
+                <motion.div 
+                    initial={{ scale: 0.9, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    exit={{ scale: 0.9, opacity: 0 }}
+                    className="relative w-full max-w-lg"
+                >
+                    <button 
+                        onClick={() => toggleDesignSystem(false)}
+                        className="absolute -top-12 right-0 p-2 text-white/40 hover:text-white transition-all uppercase text-[10px] font-black tracking-widest flex items-center gap-2"
+                    >
+                        <X className="w-4 h-4" /> Close Configuration
+                    </button>
+                    <DesignSystemPanel 
+                        projectId={currentProject.id} 
+                        initialConfig={currentProject.design_system}
+                        onSave={(next) => {
+                            setCurrentProject({ ...currentProject, design_system: next })
+                            toggleDesignSystem(false)
+                        }}
+                    />
+                </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
 
         <div className="flex-1 relative border-r border-white/5 bg-white">
           {/* Header Toolbar */}
@@ -213,6 +225,13 @@ export default function ProjectPage() {
 
             <div className="flex items-center gap-3 pointer-events-auto">
                <ThemeToggle />
+               <Button 
+                  variant="secondary"
+                  onClick={() => toggleDesignSystem()}
+                  className={`tactile-glass h-11 w-11 p-0 flex items-center justify-center transition-all ${isDesignSystemOpen ? 'bg-cyan-500 text-black shadow-[0_0_20px_#06b6d4]' : ''}`}
+               >
+                  <Palette className="w-4 h-4" />
+               </Button>
                <Button 
                  variant="vibrant"
                  onClick={() => toggleExportPanel(true)}

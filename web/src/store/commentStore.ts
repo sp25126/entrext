@@ -33,12 +33,27 @@ interface CommentStore {
     markerId: string        // for confirming the overlay marker
   }) => Promise<void>
   resolveComment: (commentId: string) => Promise<void>
+  updateTriage: (commentId: string, triage: Partial<Comment>) => void
+  addFromRemote: (comment: Comment) => void
+  retryComment: (tempId: string) => Promise<void>
+  submitting: Set<string>
 }
 
 export const useCommentStore = create<CommentStore>((set, get) => ({
   comments: [],
   isLoading: false,
   error: null,
+  submitting: new Set(),
+  
+  updateTriage: (commentId, triage) => set(state => ({
+    comments: state.comments.map(c => c.id === commentId ? { ...c, ...triage } : c)
+  })),
+
+  addFromRemote: (comment) => set(state => {
+    // Don't add duplicates (might already be added via optimistic update)
+    if (state.comments.find(c => c.id === comment.id)) return state
+    return { comments: [...state.comments, comment] }
+  }),
   
   fetchComments: async (projectId) => {
     set({ isLoading: true, error: null })
@@ -53,10 +68,17 @@ export const useCommentStore = create<CommentStore>((set, get) => ({
   },
   
   addComment: async (payload) => {
+    const { submitting } = get()
+    if (submitting.has(payload.markerId)) {
+      console.warn('[Entrext] Duplicate submission blocked')
+      return
+    }
+
+    set(state => ({ submitting: new Set([...state.submitting, payload.markerId]) }))
     const { markerId, ...body } = payload
     
     // Optimistic: add immediately with temp id
-    const tempId = `temp_${Date.now()}`
+    const tempId = markerId // Using markerId as tempId for retry context
     const optimistic: Comment = {
       id: tempId, 
       status: 'open', 
@@ -87,7 +109,35 @@ export const useCommentStore = create<CommentStore>((set, get) => ({
       }))
       
       const { useOverlayStore } = await import('./overlayStore')
-      useOverlayStore.getState().failMarker(markerId)
+      const os = useOverlayStore.getState()
+      if (os.failMarker) os.failMarker(markerId)
+    } finally {
+      set(state => {
+        const next = new Set(state.submitting)
+        next.delete(payload.markerId)
+        return { submitting: next }
+      })
+    }
+  },
+
+  retryComment: async (tempId: string) => {
+    const comment = get().comments.find(c => c.id === tempId)
+    if (!comment) return
+
+    set(state => ({
+      comments: state.comments.map(c => c.id === tempId ? { ...c, status: 'saving' as any } : c)
+    }))
+
+    try {
+      const { markerId, status, id, ...body } = comment as any
+      const saved = await api.createComment(body) as Comment
+      set(state => ({
+        comments: state.comments.map(c => c.id === tempId ? saved : c)
+      }))
+    } catch {
+      set(state => ({
+        comments: state.comments.map(c => c.id === tempId ? { ...c, status: 'failed' as any } : c)
+      }))
     }
   },
   

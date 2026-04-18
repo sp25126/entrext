@@ -1,28 +1,42 @@
 const BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8765"
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+export function createRequest<T>(path: string, options?: RequestInit): {
+  promise: Promise<T>
+  abort: () => void
+} {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 10000)
   
-  try {
-    const res = await fetch(`${BASE}${path}`, {
-      ...options,
-      signal: controller.signal,
-      headers: { 
-        "Content-Type": "application/json", 
-        ...options?.headers 
-      },
-    })
-    
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }))
-      throw new Error(err.detail ?? "Request failed")
-    }
-    
-    return res.json()
-  } finally {
+  const promise = fetch(`${BASE}${path}`, {
+    ...options,
+    signal: controller.signal,
+    headers: { 
+      "Content-Type": "application/json", 
+      ...options?.headers 
+    },
+  })
+  .then(async res => {
     clearTimeout(timeout)
+    if (!res.ok) {
+      // Handles the new standardized AppError format
+      const err = await res.json().catch(() => ({ message: res.statusText }))
+      throw new Error(err.message || err.detail || 'Request failed')
+    }
+    return res.json() as T
+  })
+
+  return { 
+    promise, 
+    abort: () => { 
+      clearTimeout(timeout)
+      controller.abort() 
+    } 
   }
+}
+
+// Wrapper to maintain compatibility with existing request-style calls
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  return createRequest<T>(path, options).promise
 }
 
 const mapComment = (c: any) => ({
