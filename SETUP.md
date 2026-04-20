@@ -8,14 +8,17 @@ Follow these steps to initialize your local development environment.
 - **Node.js**: 20+
 - **Database**: A Supabase account and project.
 
-## 2. Database Schema
+## 2. Definitive Database Schema
 
-Run the following SQL in your Supabase SQL Editor to initialize the necessary tables:
+Run this in your **Supabase SQL Editor**:
 
 ```sql
--- 1. Projects Table
+-- 1. Enable UUID Extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 2. Projects Table
 CREATE TABLE public.projects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name TEXT NOT NULL,
     description TEXT,
     target_url TEXT NOT NULL,
@@ -23,23 +26,49 @@ CREATE TABLE public.projects (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- 2. Comments Table
-CREATE TABLE public.comments (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+-- 3. Share Links (Access Management)
+CREATE TABLE public.share_links (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     project_id UUID REFERENCES public.projects(id) ON DELETE CASCADE,
-    text TEXT NOT NULL,
-    component_selector TEXT,
-    page_url TEXT,
-    tester_name TEXT DEFAULT 'Anonymous',
-    screenshot_url TEXT,
-    x FLOAT DEFAULT 0,
-    y FLOAT DEFAULT 0,
-    status TEXT DEFAULT 'open', -- 'open' | 'resolved'
+    token TEXT UNIQUE NOT NULL,
+    label TEXT DEFAULT 'Shared Link',
+    role TEXT CHECK (role IN ('tester', 'reviewer', 'viewer')),
+    expires_at TIMESTAMPTZ,
+    max_uses INTEGER,
+    use_count INTEGER DEFAULT 0,
+    is_active BOOLEAN DEFAULT true,
+    password_hash TEXT,
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Enable Realtime for peer-sync (Optional if using Supabase Realtime)
--- alter publication supabase_realtime add table projects, comments;
+-- 4. Comments (Audit Feedback)
+CREATE TABLE public.comments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID REFERENCES public.projects(id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    component_selector TEXT,
+    xpath TEXT,
+    tag_name TEXT,
+    inner_text TEXT,
+    page_url TEXT,
+    tester_name TEXT DEFAULT 'Anonymous',
+    screenshot_url TEXT,
+    x FLOAT,
+    y FLOAT,
+    marker_number INTEGER,
+    status TEXT DEFAULT 'open', -- 'open' | 'resolved'
+    -- AI Fields
+    severity TEXT CHECK (severity IN ('P0', 'P1', 'P2', 'P3')),
+    category TEXT,
+    ai_summary TEXT,
+    suggested_fix TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Security: Disable RLS for Prototype
+ALTER TABLE projects DISABLE ROW LEVEL SECURITY;
+ALTER TABLE comments DISABLE ROW LEVEL SECURITY;
+ALTER TABLE share_links DISABLE ROW LEVEL SECURITY;
 ```
 
 ## 3. Configuration
@@ -47,20 +76,26 @@ CREATE TABLE public.comments (
 1. **Backend**:
    - Navigate to `/backend`.
    - Copy `.env.example` to `.env`.
-   - Fill in your `SUPABASE_URL` and `SUPABASE_KEY`.
-   - Run `python -m venv venv` and `venv/Scripts/pip install -r requirements.txt`.
+   - Fill in `SUPABASE_URL`, `SUPABASE_KEY`, and `GROQ_API_KEY` (optional).
+   - Install: `pip install -r requirements.txt`.
 
 2. **Frontend**:
    - Navigate to `/web`.
    - Copy `.env.example` to `.env.local`.
-   - Fill in your `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
-   - Run `npm install`.
+   - Set `NEXT_PUBLIC_API_BASE=http://localhost:8765`.
+   - Install: `npm install`.
 
 ## 4. Launch
 
-From the root directory, run:
+Run from the **root directory** (`Entrext/`):
+
 ```bash
-python run_app.py
+# Terminal 1 — Backend (Package Mode)
+uvicorn backend.main:app --reload --port 8765
+
+# Terminal 2 — Frontend
+cd web
+npm run dev
 ```
 
 ---

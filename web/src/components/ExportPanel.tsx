@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { FileText, Code, Table, Download, Copy, Check, X, Github } from 'lucide-react'
+import { FileText, Code, Table, Download, Copy, Check, X } from 'lucide-react'
 
 type ExportFormat = 'markdown' | 'json' | 'csv'
 
@@ -48,34 +48,49 @@ export function ExportPanel({ projectId, projectName, commentCount, onClose }: P
   const BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8765'
 
   const download = async () => {
+    if (!projectId || projectId === 'undefined') {
+      console.error('[Export] projectId is missing or undefined')
+      return
+    }
+
     setDownloading(true)
     try {
-      const endpoint = format === 'markdown' ? '/export' : `/export/${format}`
-      const res = await fetch(`${BASE}${endpoint}?project_id=${projectId}`)
-      const blob = await res.blob()
-      
-      const ext = { markdown: 'md', json: 'json', csv: 'csv' }[format]
-      const filename = `entrext_${projectName.replace(/\s+/g, '_').toLowerCase()}_${projectId.slice(0, 8)}.${ext}`
-      
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filename
+      const url = `${BASE}/export?project_id=${projectId}&format=${format}`
+      console.log('[Export] Fetching:', url)
+
+      const res = await fetch(url)
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err?.message ?? `HTTP ${res.status}`)
+      }
+
+      const ext      = { markdown: 'md', json: 'json', csv: 'csv' }[format]
+      const blob     = await res.blob()
+      const downloadUrl = URL.createObjectURL(blob)
+      const a        = document.createElement('a')
+      a.href         = downloadUrl
+      a.download     = `entrext-export-${projectId.slice(0, 8)}.${ext}`
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
-      URL.revokeObjectURL(url)
+      URL.revokeObjectURL(downloadUrl)
+    } catch (err) {
+      console.error('[Export] Failed:', err)
     } finally {
       setDownloading(false)
     }
   }
 
   const copyMarkdown = async () => {
-    const res = await fetch(`${BASE}/export?project_id=${projectId}`)
-    const text = await res.text()
-    await navigator.clipboard.writeText(text)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+    try {
+      const res  = await fetch(`${BASE}/export?project_id=${projectId}&format=markdown`)
+      const text = await res.text()
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      console.error('[Export] Copy failed')
+    }
   }
 
   return (
@@ -155,7 +170,7 @@ export function ExportPanel({ projectId, projectName, commentCount, onClose }: P
       <div className="px-8 py-6 bg-white/[0.02] border-t border-white/[0.03] space-y-4">
         <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-                <Github className="w-4 h-4 text-white/20" />
+                <Code className="w-4 h-4 text-white/20" />
                 <span className="text-[8px] font-black text-white/20 uppercase tracking-widest">Enterprise Bridge</span>
             </div>
             <a href="#github-settings" className="px-3 py-1 rounded-full bg-purple-500/10 border border-purple-500/20 text-[8px] font-black text-purple-400 uppercase tracking-widest hover:bg-purple-500/20 transition-all">

@@ -1,51 +1,71 @@
-import { create } from 'zustand';
-import { Project, CreateProjectInput } from '../lib/api-contracts';
-import { api } from '../lib/api';
+// src/store/projectStore.ts
+import { create } from 'zustand'
+import { api, Project, ProjectCreate } from '@/lib/api'
 
 interface ProjectState {
-  projects: Project[];
-  currentProject: Project | null;
-  isLoading: boolean;
-  error: any | null;
+  projects:        Project[]
+  currentProject:  Project | null
+  loading:         boolean
+  error:           string | null
   
-  fetchProjects: () => Promise<void>;
-  createProject: (input: CreateProjectInput) => Promise<Project>;
-  setCurrentProject: (project: Project | null) => void;
-  clearError: () => void;
+  fetchProjects:     () => Promise<void>
+  createProject:     (input: ProjectCreate) => Promise<Project>
+  deleteProject:     (id: string) => Promise<void>
+  setCurrentProject: (project: Project | null) => void
+  clearError:        () => void
 }
 
 export const useProjectStore = create<ProjectState>((set, get) => ({
-  projects: [],
+  projects:       [],
   currentProject: null,
-  isLoading: false,
-  error: null,
+  loading:        false,
+  error:          null,
 
   setCurrentProject: (project) => set({ currentProject: project }),
-  clearError: () => set({ error: null }),
+  clearError:        () => set({ error: null }),
 
   fetchProjects: async () => {
-    set({ isLoading: true, error: null });
+    set({ loading: true, error: null })
     try {
-      const data = await api.listProjects();
-      set({ projects: data, isLoading: false });
-    } catch (err: any) {
-      set({ error: err, isLoading: false });
+      const projects = await api.projects.list()
+      set({ projects, loading: false })
+    } catch (err: unknown) {
+      set({ 
+        loading: false, 
+        error: err instanceof Error ? err.message : 'Failed to fetch projects' 
+      })
     }
   },
 
   createProject: async (input) => {
-    set({ isLoading: true, error: null });
+    set({ loading: true, error: null })
     try {
-      const project = await api.createProject(input);
-      set({ 
-        projects: [project, ...get().projects],
+      const project = await api.projects.create(input)
+      set(s => ({ 
+        projects: [project, ...s.projects],
         currentProject: project,
-        isLoading: false 
-      });
-      return project;
-    } catch (err: any) {
-      set({ error: err, isLoading: false });
-      throw err;
+        loading: false 
+      }))
+      return project
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to create project'
+      set({ loading: false, error: msg })
+      throw err
+    }
+  },
+
+  deleteProject: async (id) => {
+    const prev = get().projects
+    set(s => ({ projects: s.projects.filter(p => p.id !== id) }))
+    
+    try {
+      await api.projects.delete(id)
+    } catch (err: unknown) {
+      set({ 
+        projects: prev, 
+        error: err instanceof Error ? err.message : 'Failed to delete project' 
+      })
+      throw err
     }
   }
-}));
+}))

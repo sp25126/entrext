@@ -1,25 +1,23 @@
+// src/app/test/[shareToken]/page.tsx
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useParams } from 'next/navigation'
-import { api } from '@/lib/api'
+import { api, Comment } from '@/lib/api'
 import { Loader2, AlertCircle } from 'lucide-react'
-import { Button } from '@/components/ui/button'
 
 import { useProjectStore } from '@/store/projectStore'
 import { useCommentStore } from '@/store/commentStore'
 import { useRealtimeStore } from '@/store/realtimeStore'
 import { useOverlayStore } from '@/store/overlayStore'
-import { useUIStore } from '@/store/uiStore'
 
 export default function TesterPage() {
   const params = useParams()
   const shareToken = params.shareToken as string
   
-  const { currentProject, setCurrentProject, isLoading: isProjectLoading, error: projectError } = useProjectStore()
-  const { comments, fetchComments, error: commentError } = useCommentStore()
-  const { activeTesters, setConnected, updateCursor } = useRealtimeStore()
-  const { pendingMarker } = useOverlayStore()
+  const { currentProject, setCurrentProject, loading: isProjectLoading, error: projectError } = useProjectStore()
+  const { comments, loadComments, error: commentError } = useCommentStore()
+  const { setConnected, updateCursor } = useRealtimeStore()
 
   const wsRef = useRef<WebSocket | null>(null)
   const lastEmitRef = useRef(0)
@@ -29,11 +27,14 @@ export default function TesterPage() {
 
     async function initAudit() {
       try {
-        const project = await api.getProjectByToken(shareToken)
+        // 1. Resolve token to project
+        const project = await api.shareLinks.resolve(shareToken)
         setCurrentProject(project)
-        fetchComments(project.id)
+        
+        // 2. Load existing comments
+        await loadComments(project.id)
 
-        // Realtime
+        // 3. Setup WebSocket
         const tester_id = localStorage.getItem('tester_id') ?? (() => {
           const id = crypto.randomUUID()
           localStorage.setItem('tester_id', id)
@@ -41,7 +42,10 @@ export default function TesterPage() {
         })()
         const tester_name = localStorage.getItem('tester_name') ?? 'Auditor'
 
-        const wsUrl = `${window.location.protocol.replace('http', 'ws')}//${window.location.host.includes('localhost') ? 'localhost:8765' : window.location.host}/ws/project/${project.id}?tester_id=${encodeURIComponent(tester_id)}&tester_name=${encodeURIComponent(tester_name)}`
+        const host = window.location.host.includes('localhost') ? 'localhost:8765' : window.location.host
+        const protocol = window.location.protocol.replace('http', 'ws')
+        const wsUrl = `${protocol}//${host}/ws/project/${project.id}?tester_id=${encodeURIComponent(tester_id)}&tester_name=${encodeURIComponent(tester_name)}`
+        
         const socket = new WebSocket(wsUrl)
         wsRef.current = socket
 
@@ -52,18 +56,18 @@ export default function TesterPage() {
           if (data.type === 'CURSOR_MOVE') {
             updateCursor(data.tester_id, data.x, data.y, data.name || data.tester_name)
           }
-          if (data.type === 'COMMENT_SAVED') {
-            fetchComments(project.id)
+          if (data.type === 'NEW_COMMENT') {
+            useCommentStore.getState().addCommentFromWS(data.comment)
           }
         }
-      } catch (err: any) {
-        console.error('Audit Initialization Failed:', err)
+      } catch (err: unknown) {
+        console.error('[TesterPage] Audit Initialization Failed:', err)
       }
     }
 
     initAudit()
     return () => wsRef.current?.close()
-  }, [shareToken, setCurrentProject, fetchComments, setConnected, updateCursor])
+  }, [shareToken, setCurrentProject, loadComments, setConnected, updateCursor])
 
   const handleMouseMove = (e: React.MouseEvent) => {
     const now = Date.now()
@@ -90,7 +94,9 @@ export default function TesterPage() {
       <div className="space-y-4">
         <AlertCircle className="w-12 h-12 text-rose-500 mx-auto" />
         <h1 className="text-2xl font-black uppercase tracking-widest text-white/90">Audit Expired</h1>
-        <p className="text-white/40 text-[10px] font-bold uppercase tracking-widest">Invalid link or unauthorized access</p>
+        <p className="text-white/40 text-[10px] font-bold uppercase tracking-widest leading-relaxed">
+          {typeof error === 'string' ? error : 'Invalid link or unauthorized access'}
+        </p>
       </div>
     </div>
   )

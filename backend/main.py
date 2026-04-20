@@ -1,587 +1,743 @@
-import os, uuid, socket, ipaddress, json, asyncio
-from datetime import datetime, timezone
-from time import time
-from urllib.parse import urljoin, urlparse
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
+import os
+import json
+import secrets
+import asyncio
+import uuid
+import logging
+import hashlib
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request, Response, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
-from contextlib import asynccontextmanager
-from supabase import create_client
+from supabase import create_client, Client
 import httpx
 from bs4 import BeautifulSoup
-from schemas import (
-    ProjectCreate, ProjectResponse, PublicProjectResponse, 
-    CommentCreate, CommentResponse, HealthResponse
+from fastapi.responses import HTMLResponse, FileResponse
+from urllib.parse import urlparse, urljoin, quote
+import socket, ipaddress
+
+from .config import settings
+from .logger import logger
+from .errors import AppError, app_error_handler, validation_error_handler, unhandled_exception_handler
+from .schemas import (
+    ProjectCreate, ProjectResponse, CommentCreate, 
+    CommentResponse, ShareLinkCreate, ShareLinkResponse, 
+    ShareTokenResolveRequest
 )
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
-from pydantic import BaseModel, Field
+from .ratelimit import check_rate_limit, rate_limit
+from datetime import timezone
 
-from export_engine import build_report
-from github_export import push_to_github
+# ─── Infrastructure Initialization ──────────────────────────────────────────
+app = FastAPI(
+    title="Entrext API",
+    version="2.1.0",
+    docs_url="/docs" if os.environ.get("ENV") != "production" else None
+)
 
-load_dotenv()
+# Database Substrate
+db: Client = create_client(settings.supabase_url, settings.supabase_key)
 
-# ─── WebSocket Manager (Hardened) ─────────────────────────────────────────────
-class Manager:
+# ─── Proxy Infrastructure (Phase 4) ─────────────────────────────────────────
+BLOCKED_IPS   = {"169.254.169.254"}
+FRONTEND_BASE = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+BACKEND_URL   = os.environ.get("BACKEND_URL", "http://localhost:8765")
+
+def ssrf_check(url: str):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise AppError("INVALID_SCHEME", "Only http/https URLs are allowed", 400)
+    host = parsed.hostname or ""
+    try:
+        ip_str = socket.gethostbyname(host)
+    except socket.gaierror:
+        raise AppError("DNS_FAILED", "Could not resolve host", 400)
+    ip = ipaddress.ip_address(ip_str)
+    if ip.is_private or ip.is_loopback or ip.is_multicast or ip.is_reserved or ip_str in BLOCKED_IPS:
+        raise AppError("SSRF_BLOCKED", "Target URL is not allowed", 400)
+
+# Real-time Synchronization Hub
+class ConnectionManager:
     def __init__(self):
-        self.rooms: dict[str, dict] = {}
-        
-    async def connect(self, ws: WebSocket, room: str, tid: str, name: str):
-        await ws.accept()
-        self.rooms.setdefault(room, {})[tid] = {
-            "ws": ws,
-            "name": name,
-            "connected_at": time(),
-            "last_ping": time()
-        }
-    
-    def disconnect(self, room: str, tid: str):
-        room_data = self.rooms.get(room, {})
-        room_data.pop(tid, None)
-        if not room_data and room in self.rooms:
-            del self.rooms[room]
-            
-    async def broadcast(self, room: str, msg: dict, exclude: str = None):
-        dead = []
-        payload = json.dumps(msg)
-        
-        # Enforce max message size: 64KB to prevent OOM
-        if len(payload) > 65536:
-            print(f"[WS] Message too large ({len(payload)} bytes) — skipped")
-            return
+        self.active_connections: Dict[str, List[WebSocket]] = {}
 
-        for tid, c in list(self.rooms.get(room, {}).items()):
-            if tid == exclude: continue
-            try:
-                await c["ws"].send_text(payload)
-            except Exception:
-                dead.append(tid)
-        
-        for tid in dead:
-            self.disconnect(room, tid)
+    async def connect(self, project_id: str, websocket: WebSocket):
+        await websocket.accept()
+        if project_id not in self.active_connections:
+            self.active_connections[project_id] = []
+        self.active_connections[project_id].append(websocket)
+        logger.info(f"[WS] Peer joined project={project_id}. Total={len(self.active_connections[project_id])}")
 
-    async def ping_all(self):
-        """Send ping to all connections. Prune dead ones."""
-        dead = []
-        for room, testers in list(self.rooms.items()):
-            for tid, c in list(testers.items()):
+    def disconnect(self, project_id: str, websocket: WebSocket):
+        if project_id in self.active_connections:
+            if websocket in self.active_connections[project_id]:
+                self.active_connections[project_id].remove(websocket)
+                logger.info(f"[WS] Peer left project={project_id}")
+
+    async def broadcast(self, project_id: str, message: dict, exclude: Optional[WebSocket] = None):
+        if project_id in self.active_connections:
+            dead_links = []
+            for connection in self.active_connections[project_id]:
+                if connection == exclude: continue
                 try:
-                    await c["ws"].send_json({"type": "PING", "ts": time()})
-                    c["last_ping"] = time()
+                    await connection.send_json(message)
                 except Exception:
-                    dead.append((room, tid))
-        for r, t in dead:
-            self.disconnect(r, t)
+                    dead_links.append(connection)
+            
+            for dead in dead_links:
+                self.disconnect(project_id, dead)
 
-    def testers(self, room: str) -> list:
-        return [{"id": tid, "name": c["name"]} for tid, c in self.rooms.get(room, {}).items()]
+manager = ConnectionManager()
 
-ws_manager = Manager()
-
-# ─── Lifespan Tasks ────────────────────────────────────────────────────────────
-async def cleanup_rate_limit_windows():
-    """Runs every 5 minutes, removes all expired rate limit windows"""
-    while True:
-        await asyncio.sleep(300)
-        _windows = get_windows()
-        now = time()
-        keys_to_delete = []
-        for key, timestamps in list(_windows.items()):
-            action = key.split(":")[-1]
-            _, window_seconds = LIMITS.get(action, LIMITS["default"])
-            fresh = [t for t in timestamps if t > now - window_seconds]
-            if not fresh:
-                keys_to_delete.append(key)
-            else:
-                _windows[key] = fresh
-        for k in keys_to_delete:
-            del _windows[k]
-
-async def heartbeat_loop():
-    """Industrial-grade heartbeat: every 30s"""
-    while True:
-        await asyncio.sleep(30)
-        await ws_manager.ping_all()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Fire and forget background tasks for the app lifecycle
-    asyncio.create_task(cleanup_rate_limit_windows())
-    asyncio.create_task(heartbeat_loop())
-    yield
-
-# ─── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Entrext", version="1.0.0", redirect_slashes=False, lifespan=lifespan)
-
-# Exception Handlers
+# ─── Error Handling Substrate ────────────────────────────────────────────────
+from fastapi.exceptions import RequestValidationError
 app.add_exception_handler(AppError, app_error_handler)
 app.add_exception_handler(RequestValidationError, validation_error_handler)
-app.add_exception_handler(Exception, unhandled_error_handler)
+app.add_exception_handler(Exception, unhandled_exception_handler)
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = time()
-    response = await call_next(request)
-    duration_ms = round((time() - start) * 1000)
-    logger.info(
-        f"{request.method} {request.url.path} → {response.status_code} [{duration_ms}ms] "
-        f"IP:{request.client.host if request.client else 'unknown'}"
-    )
-    return response
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Models moved to schemas.py
-class GitHubConfigRequest(BaseModel):
-    github_repo: str = Field(..., pattern=r'^[\w.-]+/[\w.-]+$', description="owner/repo format")
-    github_token: str = Field(..., min_length=10)
-
-class DesignSystemConfig(BaseModel):
-    colors: list[str] = Field(default_factory=list)
-    fonts: list[str] = Field(default_factory=list)
-    borderRadii: list[str] = Field(default_factory=list)
-    spacingUnit: int = 4
-
-# ─── Health ────────────────────────────────────────────────────────────────────
+# ─── Health Check ─────────────────────────────────────────────────────────────
+@app.get("/health", tags=["System"])
 def health():
-    return {
-        "status": "ok", 
-        "version": "1.0.0", 
-        "time": datetime.now(timezone.utc).isoformat(),
-        "db_connected": True
-    }
+    """Validates connectivity without leaking internals."""
+    try:
+        db.table("projects").select("id").limit(1).execute()
+        return {"status": "ok", "db_connected": True}
+    except Exception as e:
+        logger.error(f"Health check failure: {str(e)}")
+        return {"status": "degraded", "db_connected": False}
 
-# ─── Projects ──────────────────────────────────────────────────────────────────
-@app.post("/projects/", status_code=201, response_model=ProjectResponse)
-def create_project(b: ProjectCreate, request: Request):
-    check_rate_limit(request, "create_project")
+# ─── Projects (Auth-less Production) ──────────────────────────────────────────
+@app.post("/projects/", status_code=201, response_model=ProjectResponse, dependencies=[Depends(rate_limit(10, 60))])
+def create_project(b: ProjectCreate):
     try:
         r = db.table("projects").insert({
             "name": b.name,
             "description": b.description,
-            "target_url": b.target_url,
-            "share_token": uuid.uuid4().hex[:16],
+            "target_url": str(b.target_url),
+            "share_token": secrets.token_urlsafe(12),
         }).execute()
-        if not r.data: raise AppError("DB_INSERT_FAILED", "Failed to create project", 500)
+        if not r.data: raise AppError("DB_FAILED", "Could not save project", 500)
         return r.data[0]
-    except AppError: raise
     except Exception as e:
-        raise AppError("INTERNAL_ERROR", "An internal error occurred", 500)
+        logger.error(f"Project creation failed: {str(e)}")
+        raise AppError("DB_FAILED", "Internal database error", 500)
 
-@app.get("/projects/", response_model=list[ProjectResponse])
+@app.get("/projects/", response_model=List[ProjectResponse])
 def list_projects():
     return db.table("projects").select("*").order("created_at", desc=True).execute().data
 
-@app.get("/projects/by-id/{pid}/", response_model=ProjectResponse)
-def get_project(pid: str):
-    r = db.table("projects").select("*").eq("id", pid).execute()
-    if not r.data: raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
-    return r.data[0]
-
-@app.get("/projects/by-token/{token}/", response_model=PublicProjectResponse)
-def get_by_token(token: str):
-    # Public view doesn't return created_at to stay minimal
-    r = db.table("projects").select("id,name,description,target_url,share_token").eq("share_token", token).execute()
-    if not r.data: raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
-    return r.data[0]
-
-@app.delete("/projects/{pid}/")
-def delete_project(pid: str):
-    db.table("projects").delete().eq("id", pid).execute()
-    return {"deleted": pid}
-
-@app.put("/projects/{project_id}/github")
-async def save_github_config(project_id: str, body: GitHubConfigRequest):
-    db.table("projects").update({
-        "github_repo": body.github_repo,
-        "github_token": body.github_token  # In production: encrypt this
-    }).eq("id", project_id).execute()
-    return {"status": "saved"}
-
-@app.put("/projects/{project_id}/design-system")
-def save_design_system(project_id: str, body: DesignSystemConfig):
-    db.table("projects").update({
-        "design_system": body.model_dump()
-    }).eq("id", project_id).execute()
-    return {"status": "saved"}
-
-@app.post("/projects/{project_id}/push-github")
-async def push_github_issues(project_id: str, request: Request):
-    check_rate_limit(request, "export")
-    p_data = db.table("projects").select("*").eq("id", project_id).execute().data
-    if not p_data: raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
-    project = p_data[0]
-    
-    if not project.get("github_token") or not project.get("github_repo"):
-        raise AppError("GITHUB_NOT_CONFIGURED", "GitHub not configured for this project", 400)
-        
-    comments = db.table("comments").select("*").eq("project_id", project_id).execute().data
-    result = await push_to_github(comments, project, project["github_token"], project["github_repo"])
-    return result
-
-# ─── Comments ──────────────────────────────────────────────────────────────────
-@app.post("/comments/", status_code=201, response_model=CommentResponse)
-def create_comment(b: CommentCreate, request: Request, background_tasks: BackgroundTasks):
-    check_rate_limit(request, "create_comment")
+@app.get("/projects/{project_id}", response_model=ProjectResponse)
+def get_project(project_id: str):
     try:
-        r = db.table("comments").insert({
-            "project_id": b.project_id,
-            "text": b.text,
-            "component_selector": b.component_selector,
-            "page_url": b.page_url,
-            "tester_name": b.tester_name,
-            "screenshot_url": b.screenshot_url,
-            "x": b.x, "y": b.y,
-            "status": "open",
-            "selector_score": b.selector_score,
-            "session_data": b.session_data,
-        }).execute()
-        if not r.data: raise AppError("DB_INSERT_FAILED", "Failed to save comment", 500)
-        
-        comment = r.data[0]
-        # Fire AI Triage AFTER response is sent
-        background_tasks.add_task(
-            triage_comment, 
-            comment["id"], 
-            b.text, 
-            b.component_selector, 
-            b.project_id
-        )
-        return comment
+        r = db.table("projects").select("*").eq("id", project_id).single().execute()
+        if not r.data:
+            raise AppError("NOT_FOUND", "Project not found", 404)
+        return r.data
     except AppError: raise
+    except Exception: raise AppError("DB_FAILED", "Retrieval failed", 500)
+
+@app.get("/projects/by-id/{project_id}/", response_model=ProjectResponse)
+def get_project_alias(project_id: str):
+    return get_project(project_id)
+
+@app.delete("/projects/{project_id}", status_code=204)
+def delete_project(project_id: str):
+    try:
+        db.table("projects").delete().eq("id", project_id).execute()
+        return Response(status_code=204)
     except Exception as e:
-        raise AppError("INTERNAL_ERROR", "An internal error occurred", 500)
+        logger.error(f"Deletion failed {project_id}: {str(e)}")
+        raise AppError("DB_FAILED", "Deletion error", 500)
 
-@app.get("/comments/{pid}/", response_model=list[CommentResponse])
-def get_comments(pid: str):
-    return db.table("comments").select("*").eq("project_id", pid).order("created_at").execute().data
+# ─── Real-time Engine ─────────────────────────────────────────────────────────
+@app.websocket("/ws/{project_id}")
+async def websocket_endpoint(websocket: WebSocket, project_id: str):
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        await websocket.close(code=4000)
+        return
 
-@app.patch("/comments/{cid}/resolve/", response_model=CommentResponse)
-def resolve(cid: str):
-    r = db.table("comments").update({"status": "resolved"}).eq("id", cid).execute()
-    if not r.data: raise AppError("COMMENT_NOT_FOUND", "Comment not found", 404)
-    return r.data[0]
+    await manager.connect(project_id, websocket)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+                await manager.broadcast(project_id, msg, exclude=websocket)
+            except json.JSONDecodeError:
+                pass 
+    except WebSocketDisconnect:
+        manager.disconnect(project_id, websocket)
+    except Exception:
+        manager.disconnect(project_id, websocket)
 
-# ─── Export ────────────────────────────────────────────────────────────────────
-@app.get("/export")
-def export_md(project_id: str, request: Request):
-    check_rate_limit(request, "export")
-    p_data = db.table("projects").select("*").eq("id", project_id).execute().data
-    if not p_data:
-        raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
-    p = p_data[0]
-    comments = db.table("comments").select("*").eq("project_id", project_id).order("created_at").execute().data
-    
-    report = build_report(p, comments)
-    filename = p['name'].replace(' ', '_').lower()[:30]
-    
-    return Response(
-        content=report,
-        media_type="text/markdown; charset=utf-8",
+# ─── Comments ────────────────────────────────────────────────────────────────
+@app.post("/comments", status_code=201, response_model=CommentResponse)
+async def create_comment(b: CommentCreate, request: Request, background_tasks: BackgroundTasks):
+    check_rate_limit(request, "create_comment")
+
+    # Validate project_id is a proper UUID format
+    try:
+        uuid.UUID(b.project_id)
+    except ValueError:
+        raise AppError("INVALID_UUID", f"Project ID '{b.project_id}' is not a valid UUID format", 400)
+
+    # Verify project exists — returns clean 404 instead of DB constraint error
+    proj = db.table("projects").select("id").eq("id", b.project_id).execute()
+    if not proj.data:
+        raise AppError("NOT_FOUND", f"Project {b.project_id} not found", 404)
+
+    # Cause C — screenshot_url safety (don't choke DB with huge base64)
+    screenshot = b.screenshot_url
+    if screenshot and screenshot.startswith('data:image') and len(screenshot) > 500_000:
+        logger.warning(f"[comments] screenshot_url truncated — was {len(screenshot)} chars")
+        screenshot = screenshot[:100] + "...[truncated]"
+
+    insert = {
+        "project_id":         b.project_id,
+        "text":               b.text.strip(),
+        "component_selector": b.component_selector or "",
+        "xpath":              b.xpath or "",
+        "tag_name":           b.tag_name or "",
+        "inner_text":         b.inner_text or "",
+        "page_url":           b.page_url or "/",
+        "tester_name":        b.tester_name or "Anonymous",
+        "x":                  b.x or 0,
+        "y":                  b.y or 0,
+        "marker_number":      b.marker_number or 0,
+        "screenshot_url":     screenshot, # Use sanitized version
+        "severity":           None,
+        "status":             "open",
+    }
+
+    try:
+        r = db.table("comments").insert(insert).execute()
+        if not r.data:
+            raise Exception("Insert returned empty data — possible RLS block or missing column")
+    except Exception as e:
+        err_str = str(e)
+        logger.error(f"[DB ERROR] Full Report: {err_str}")
+        # Return full error to frontend temporarily for hardening diagnostic
+        raise AppError("DB_ERROR", f"Substrate write failed: {err_str}", 500)
+
+    comment = r.data[0]
+
+    # Broadcast + AI triage in background
+    background_tasks.add_task(
+        manager.broadcast,
+        b.project_id,
+        {"type": "NEW_COMMENT", "comment": comment}
+    )
+    background_tasks.add_task(run_ai_triage, comment["id"], b.text, b.project_id)
+
+    return comment
+
+
+async def run_ai_triage(comment_id: str, text: str, project_id: str):
+    """Classify severity, update DB, then broadcast the update."""
+    try:
+        import os, httpx
+        groq_key = os.environ.get("GROQ_API_KEY", "")
+        if not groq_key:
+            severity = "P2"  # default if no AI key
+        else:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "llama3-8b-8192",
+                        "messages": [{
+                            "role": "user",
+                            "content": (
+                                f"Classify this UI bug report as P0 (critical/crash), "
+                                f"P1 (major), P2 (minor), or P3 (cosmetic). "
+                                f"Reply with ONLY the label, nothing else.\n\nFeedback: {text}"
+                            )
+                        }],
+                        "max_tokens": 5,
+                        "temperature": 0,
+                    }
+                )
+            severity = resp.json()["choices"][0]["message"]["content"].strip()
+            if severity not in ("P0","P1","P2","P3"):
+                severity = "P2"
+
+        # Update DB
+        db.table("comments").update({"severity": severity}).eq("id", comment_id).execute()
+
+        # Broadcast severity update to all clients
+        await manager.broadcast(
+            project_id,
+            {"type": "COMMENT_TRIAGED", "comment_id": comment_id, "severity": severity}
+        )
+    except Exception as e:
+        logger.warning(f"AI triage failed: {type(e).__name__}")
+
+@app.get("/comments/{project_id}/", response_model=List[CommentResponse])
+def get_comments(project_id: str):
+    return db.table("comments").select("*").eq("project_id", project_id).order("created_at", desc=True).execute().data
+
+# ─── Sharing Substrate ────────────────────────────────────────────────────────
+from pydantic import BaseModel, Field
+from typing import Literal
+
+# Note: define models here if not imported from schemas to avoid drift
+class ShareLinkCreate(BaseModel):
+    label: str = Field(default="Shared Link", max_length=60)
+    role: Literal["tester", "reviewer", "viewer"] = "tester"
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=365)
+    max_uses: Optional[int] = Field(default=None, ge=1, le=10000)
+    password: Optional[str] = Field(default=None, max_length=100)
+
+class ShareLinkOut(BaseModel):
+    id: str
+    project_id: str
+    token: str
+    label: str
+    role: str
+    expires_at: Optional[str]
+    max_uses: Optional[int]
+    use_count: int
+    is_active: bool
+    created_at: str
+    share_url: str
+
+def build_share_url(token: str) -> str:
+    base = settings.frontend_url or "http://localhost:3000"
+    return f"{base.rstrip('/')}/t/{token}"
+
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+@app.get("/projects/{project_id}/share-links", response_model=List[ShareLinkOut])
+def list_share_links(project_id: str):
+    # Validate UUID format before DB query
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        raise AppError("INVALID_UUID", f"'{project_id}' is not a valid UUID format", 400)
+
+    try:
+        r = db.table("share_links").select("*").eq("project_id", project_id).order("created_at", desc=True).execute()
+        return [
+            {**link, "share_url": build_share_url(link["token"])}
+            for link in (r.data or [])
+        ]
+    except Exception as e:
+        logger.warning(f"[DB_FALLBACK] Share-links list failed: {str(e)}")
+        # Check if it's a migration error
+        if "share_links" in str(e):
+             raise AppError("MIGRATION_REQUIRED", "Table 'share_links' not found. Run SQL migration.", 412)
+        return []
+
+@app.post("/projects/{project_id}/share-links", response_model=ShareLinkOut, status_code=201, dependencies=[Depends(rate_limit(5, 60))])
+def create_share_link(project_id: str, body: ShareLinkCreate):
+    # Validate UUID format before DB query
+    try:
+        uuid.UUID(project_id)
+    except ValueError:
+        raise AppError("INVALID_UUID", f"'{project_id}' is not a valid UUID format", 400)
+
+    # Verify project exists
+    try:
+        p = db.table("projects").select("id").eq("id", project_id).execute()
+        if not p.data:
+            raise AppError("NOT_FOUND", "Project not found", 404)
+    except Exception as e:
+        logger.error(f"Project check failed: {str(e)}")
+        raise AppError("DB_ERROR", "Could not verify project existence", 500)
+
+    expires_at = None
+    if body.expires_in_days:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)).isoformat()
+
+    password_hash = None
+    if body.password:
+        password_hash = hash_password(body.password)
+
+    token = secrets.token_urlsafe(20)
+
+    insert_data = {
+        "project_id": project_id,
+        "token": token,
+        "label": body.label,
+        "role": body.role,
+        "expires_at": expires_at,
+        "max_uses": body.max_uses,
+        "use_count": 0,
+        "is_active": True,
+        "password_hash": password_hash,
+    }
+
+    try:
+        r = db.table("share_links").insert(insert_data).execute()
+        if not r.data:
+            raise AppError("DB_FAILED", "Insert returned no data", 500)
+        link = r.data[0]
+        return {**link, "share_url": build_share_url(link["token"])}
+    except Exception as e:
+        logger.warning(f"Share-link creation failed: {str(e)}")
+        if "share_links" in str(e):
+            raise AppError("MIGRATION_REQUIRED", "Table 'share_links' not found. Run SQL migration.", 412)
+        raise AppError("DB_ERROR", f"Could not create share link: {str(e)}", 500)
+
+@app.delete("/projects/{project_id}/share-links/{link_id}", status_code=200)
+def revoke_share_link(project_id: str, link_id: str):
+    try:
+        db.table("share_links").update({"is_active": False}).eq("id", link_id).eq("project_id", project_id).execute()
+        return {"status": "revoked", "id": link_id}
+    except Exception as e:
+        logger.warning(f"[MIGRATION_REQUIRED] Revovation failed: {str(e)}")
+        raise AppError("MIGRATION_REQUIRED", "Table 'share_links' not found. Please run the SQL migration in Supabase.", 412)
+
+class TokenResolveBody(BaseModel):
+    password: Optional[str] = None
+
+class PublicTokenResponse(BaseModel):
+    project_id: str
+    project_name: str
+    project_description: Optional[str]
+    target_url: str
+    role: str
+    token: str
+
+@app.post("/resolve-token/{token}")
+def resolve_token(token: str, body: dict = Body(default={})):
+    # Use limit(1) instead of .single() — .single() throws on missing rows in some postgrest versions
+    try:
+        r = (
+            db.table("share_links")
+            .select("*, projects(id, name, description, target_url)")
+            .eq("token", token)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        err_str = str(e)
+        logger.warning(f"[resolve_token] DB error: {err_str}")
+        if "share_links" in err_str or "PGRST205" in err_str:
+            raise AppError("MIGRATION_REQUIRED", "Please run the share_links SQL migration", 412)
+        raise AppError("not_found", "Invalid link", 404)
+
+    if not r.data:
+        raise AppError("not_found", "Link not found", 404)
+
+    link    = r.data[0]
+    project = link.get("projects") or {}
+
+    if not link.get("is_active", False):
+        raise AppError("link_revoked", "This link has been revoked by the owner", 410)
+
+    if link.get("expires_at"):
+        try:
+            exp = datetime.fromisoformat(link["expires_at"].replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) > exp:
+                raise AppError("link_expired", "This link has expired", 410)
+        except AppError:
+            raise
+        except Exception:
+            pass  # Malformed date — allow through
+
+    if link.get("max_uses") and link.get("use_count", 0) >= link["max_uses"]:
+        raise AppError("link_exhausted", "This link has reached its usage limit", 410)
+
+    if link.get("password_hash"):
+        pw = body.get("password") or ""
+        if not pw:
+            raise AppError("password_required", "This link requires a password", 401)
+        if hashlib.sha256(pw.encode()).hexdigest() != link["password_hash"]:
+            raise AppError("wrong_password", "Incorrect password", 401)
+
+    # Increment use count
+    try:
+        db.table("share_links").update(
+            {"use_count": link.get("use_count", 0) + 1}
+        ).eq("id", link["id"]).execute()
+    except Exception:
+        pass  # Non-fatal — don't block the tester from entering
+
+    return {
+        "project_id":          project.get("id"),
+        "project_name":        project.get("name") or "Untitled Project",
+        "project_description": project.get("description") or "",
+        "target_url":          project.get("target_url") or "",
+        "role":                link.get("role") or "tester",
+        "token":               token,
+        "is_active":           True,
+    }
+
+# ─── Proxy & Overlay Substrate (Phase 4) ────────────────────────────────────
+
+@app.get("/proxy")
+async def proxy(
+    url: str,
+    project_id: str = "",   # passed so overlay.js knows which project
+    response: Response = None
+):
+    if not url:
+        raise AppError("MISSING_URL", "url query param is required", 400)
+
+    ssrf_check(url)
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=10.0,
+            headers={"User-Agent": "Mozilla/5.0 (Entrext Proxy)"}
+        ) as client:
+            upstream = await client.get(url)
+    except httpx.TimeoutException:
+        raise AppError("PROXY_TIMEOUT", "Target site did not respond in time", 504)
+    except Exception as e:
+        raise AppError("PROXY_ERROR", f"Could not fetch target site", 502)
+
+    content_type = upstream.headers.get("content-type", "")
+    if "text/html" not in content_type:
+        # Non-HTML asset — return as-is (CSS, JS, images)
+        return Response(
+            content=upstream.content,
+            media_type=content_type,
+            headers={"X-Proxy-Status": "passthrough"}
+        )
+
+    # ── DOM transformation ──────────────────────────────────────────────────
+    soup = BeautifulSoup(upstream.text, "lxml")
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+
+    # Rewrite all relative URLs to absolute
+    for tag, attr in [("a","href"),("link","href"),("script","src"),
+                       ("img","src"),("form","action"),("source","src")]:
+        for el in soup.find_all(tag, **{attr: True}):
+            val = el[attr]
+            if val.startswith(("http://","https://","data:","#","javascript:")):
+                continue
+            el[attr] = urljoin(base, val)
+
+    # Remove X-Frame-Options and CSP meta tags that block iframe
+    for meta in soup.find_all("meta"):
+        http_equiv = (meta.get("http-equiv") or "").lower()
+        if "x-frame-options" in http_equiv or "content-security-policy" in http_equiv:
+            meta.decompose()
+
+    # ── Bridge injection — overlay.js served by Next.js frontend ───────────
+    # Pass projectId and apiBase as data attributes so overlay.js knows them
+    bridge = soup.new_tag("script")
+    bridge["src"]          = f"{FRONTEND_BASE}/overlay.js"
+    bridge["data-project"] = project_id
+    bridge["data-api"]     = BACKEND_URL
+    bridge["defer"]        = True
+
+    body = soup.find("body")
+    if body:
+        body.append(bridge)
+    else:
+        soup.append(bridge)
+
+    return HTMLResponse(
+        content=str(soup),
         headers={
-            "Content-Disposition": f'attachment; filename="entrext_{filename}_{project_id[:8]}.md"',
-            "X-Total-Issues": str(len(comments)),
+            "X-Proxy-Status":            "ok",
+            "X-Proxy-Origin":            base,
+            "Access-Control-Allow-Origin": "*",
         }
     )
 
-@app.get("/export/json")
-def export_json(project_id: str, request: Request):
-    """Returns structured JSON for programmatic consumption"""
-    check_rate_limit(request, "export")
-    p_data = db.table("projects").select("*").eq("id", project_id).execute().data
-    if not p_data: raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
-    comments = db.table("comments").select("*").eq("project_id", project_id).order("severity", "created_at").execute().data
-    return {
-        "project": p_data[0],
-        "summary": {
-            "total": len(comments),
-            "open": len([c for c in comments if c.get("status") != "resolved"]),
-            "by_severity": {s: len([c for c in comments if c.get("severity") == s]) for s in ["P0","P1","P2","P3"]},
-        },
-        "issues": comments
-    }
+# ─── Data Persistence & Export (Phase 5) ────────────────────────────────────
 
-@app.get("/export/csv")
-def export_csv(project_id: str, request: Request):
-    """Returns CSV for spreadsheet import"""
-    import csv, io
-    check_rate_limit(request, "export")
-    p_data = db.table("projects").select("*").eq("id", project_id).execute().data
-    if not p_data: raise AppError("PROJECT_NOT_FOUND", "Project not found", 404)
+from .export_engine import build_report
+
+@app.get("/export")
+async def export_project(project_id: str, format: str = "markdown"):
+    print(f"[Export] Received project_id={project_id!r} format={format!r}")
+
+    # Fetch project
+    proj = db.table("projects").select("*").eq("id", project_id).execute()
+    print(f"[Export] Project found: {bool(proj.data)}")
+    if not proj.data:
+        raise AppError("NOT_FOUND", "Project not found", 404)
     
-    comments = db.table("comments").select("*").eq("project_id", project_id).execute().data
-    
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=["id","severity","category","ai_summary","text","component_selector","tester_name","status","created_at","suggested_fix"])
-    writer.writeheader()
-    for c in comments:
-        writer.writerow({k: c.get(k, "") for k in writer.fieldnames})
-        
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="entrext_{project_id[:8]}.csv"'}
-    )
+    project = proj.data[0]
 
-# ─── SSRF Guard (Nuclear Edition) ──────────────────────────────────────────────
-FORBIDDEN_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),   # AWS/GCP metadata
-    ipaddress.ip_network("100.64.0.0/10"),    # Carrier-grade NAT
-    ipaddress.ip_network("::1/128"),           # IPv6 loopback
-    ipaddress.ip_network("fc00::/7"),          # IPv6 private
-    ipaddress.ip_network("fe80::/10"),         # IPv6 link-local
-    ipaddress.ip_network("0.0.0.0/8"),         # This network
-]
+    # Fetch all comments
+    all_comments = db.table("comments").select("*").eq("project_id", project_id).execute()
+    comments = all_comments.data or []
+    print(f"[Export] Comments count: {len(comments)}")
 
-def resolve_and_validate(hostname: str) -> str:
-    """
-    Resolves hostname to IP, validates against all forbidden networks.
-    Return the first safe IP string.
-    """
-    try:
-        # Resolve both IPv4 and IPv6
-        results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    except socket.gaierror:
-        raise ValueError("Hostname could not be resolved")
-    
-    if not results:
-        raise ValueError("No DNS records found")
-    
-    first_safe_ip = None
-    for (family, _, _, _, sockaddr) in results:
-        raw_ip = sockaddr[0] # sockaddr is (ip, port, ...)
-        try:
-            addr = ipaddress.ip_address(raw_ip)
-        except ValueError:
-            continue
-            
-        for network in FORBIDDEN_NETWORKS:
-            if addr in network:
-                raise ValueError("URL not allowed")
-                
-        if first_safe_ip is None:
-            first_safe_ip = raw_ip
-            
-    if not first_safe_ip:
-        raise ValueError("No safe IP found")
-    return first_safe_ip
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    open_issues     = [c for c in comments if c.get("status","open") == "open"]
+    resolved_issues = [c for c in comments if c.get("status","open") == "resolved"]
 
-def ssrf_safe_v2(url: str) -> tuple[bool, str]:
-    """Returns (is_safe, resolved_ip)"""
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False, ""
-        if not parsed.hostname:
-            return False, ""
-        ip = resolve_and_validate(parsed.hostname)
-        return True, ip
-    except ValueError:
-        return False, ""
+    # ─────────────────────────────────────────────────────────────────────────
+    # MARKDOWN
+    # ─────────────────────────────────────────────────────────────────────────
+    if format == "markdown":
+        SEV_ICON = {"P0":"🔴","P1":"🟠","P2":"🟡","P3":"⚪"}
 
-# ─── Proxy ─────────────────────────────────────────────────────────────────────
-PROXY_FAIL_HTML = """<!DOCTYPE html>
-<html><head><meta name="entrext-proxy-status" content="failed"></head>
-<body data-entrext-failed="true" style="background:#0a0a0a;color:white;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
-  <div style="text-align:center;opacity:0.5;">[ PROXY_SIGNAL_INTERRUPTED ]</div>
-</body></html>"""
+        def comment_block(c: dict, idx: int) -> str:
+            sev      = c.get("severity") or "P2"
+            status   = c.get("status", "open")
+            selector = c.get("component_selector") or c.get("xpath") or "unknown"
+            tester   = c.get("tester_name") or "Anonymous"
+            page     = c.get("page_url") or "/"
+            tag      = c.get("tag_name") or ""
+            text     = c.get("text") or ""
+            created  = (c.get("created_at") or "")[:19].replace("T"," ")
 
-PROXY_ADVANCED_HTML = """<!DOCTYPE html>
-<html><head><meta name="entrext-proxy-status" content="advanced"></head>
-<body data-entrext-failed="advanced" style="background:#0a0a0a;color:white;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
-  <div style="text-align:center;opacity:0.5;">[ ADVANCED_RENDER_DETECTED ]</div>
-</body></html>"""
+            lines = [
+                f"### Issue #{idx} — {SEV_ICON.get(sev,'⚪')} {sev} {'✅ Resolved' if status == 'resolved' else '🔴 Open'}",
+                "",
+                f"| Field | Value |",
+                f"|-------|-------|",
+                f"| **Component** | `{selector}` |",
+                f"| **Tag** | `{tag}` |",
+                f"| **Page** | `{page}` |",
+                f"| **Tester** | {tester} |",
+                f"| **Reported** | {created} |",
+                f"| **Priority** | {sev} |",
+                f"| **Status** | {status.capitalize()} |",
+                "",
+                f"**Feedback:**",
+                f"> {text}",
+                "",
+            ]
 
-@app.get("/proxy", response_class=HTMLResponse)
-async def proxy(url: str, request: Request):
-    check_rate_limit(request, "proxy")
-    is_safe, resolved_ip = ssrf_safe_v2(url)
-    if not is_safe:
-        raise AppError("SSRF_BLOCKED", "URL not allowed", 400)
-    
-    parsed = urlparse(url)
-    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "Referer": url,
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Host": parsed.hostname
-    }
+            if c.get("inner_text"):
+                lines.insert(-1, f"**Element text:** `{c['inner_text'][:100]}`")
+                lines.insert(-1, "")
 
-    try:
-        async with httpx.AsyncClient(transport=transport, timeout=10, follow_redirects=False) as client:
-            curr_url = url
-            max_redirects = 3
-            redirect_count = 0
-            
-            resp = await client.get(curr_url, headers=headers)
-            
-            while resp.is_redirect and redirect_count < max_redirects:
-                redirect_url = urljoin(curr_url, resp.headers.get("location", ""))
-                if not redirect_url:
-                    break
-                
-                r_safe, r_ip = ssrf_safe_v2(redirect_url)
-                if not r_safe:
-                    raise AppError("SSRF_BLOCKED", "Redirect target not allowed", 400)
-                
-                curr_url = redirect_url
-                headers["Host"] = urlparse(curr_url).hostname
-                resp = await client.get(curr_url, headers=headers)
-                redirect_count += 1
+            return "\n".join(lines)
 
-        ct = resp.headers.get("content-type", "")
-        if "html" not in ct:
-            return HTMLResponse(PROXY_ADVANCED_HTML, headers={"X-Entrext-Status": "advanced"})
-            
-        soup = BeautifulSoup(resp.text, "lxml")
-        
-        scripts = " ".join(s.get("src", "") + (s.string or "") for s in soup.find_all("script"))
-        is_advanced = any(kw in scripts.lower() for kw in ["three.js", "webgl", "spline", "@splinetool", "babylon", "pixi", "canvas"])
-        if is_advanced:
-            return HTMLResponse(PROXY_ADVANCED_HTML, headers={"X-Entrext-Status": "advanced"})
+        md = [
+            f"# Entrext Feedback Report",
+            f"## {project.get('name','Untitled Project')}",
+            "",
+            f"| | |",
+            f"|---|---|",
+            f"| **Target URL** | {project.get('target_url','')} |",
+            f"| **Exported** | {ts} |",
+            f"| **Total Issues** | {len(comments)} |",
+            f"| **Open** | {len(open_issues)} |",
+            f"| **Resolved** | {len(resolved_issues)} |",
+            "",
+            "---",
+            "",
+        ]
 
-        for tag in soup.find_all(True):
-            for attr in ["href", "src", "action"]:
-                v = tag.get(attr, "")
-                if v and not v.startswith(("http", "data:", "#", "javascript:", "mailto:", "//")):
-                    tag[attr] = urljoin(curr_url, v)
-        
-        for meta in soup.find_all("meta", attrs={"http-equiv": lambda v: v and "x-frame-options" in v.lower()}):
-            meta.decompose()
-        
-        # Inject html2canvas + overlay
-        h2c = soup.new_tag("script", src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js")
-        overlay_src = "http://localhost:3000/overlay.js"
-        overlay = soup.new_tag("script", src=overlay_src)
-        
-        target = soup.body or soup.html or soup
-        target.append(h2c)
-        target.append(overlay)
-        
-        return HTMLResponse(
-            str(soup), 
-            headers={
-                "X-Proxy-Cache": "MISS", 
-                "X-Entrext-Status": "ok",
-                "Access-Control-Allow-Origin": "*"
-            }
+        if open_issues:
+            md.append("## 🔴 Open Issues\n")
+            for i, c in enumerate(open_issues, 1):
+                md.append(comment_block(c, i))
+
+        if resolved_issues:
+            md.append("## ✅ Resolved Issues\n")
+            for i, c in enumerate(resolved_issues, 1):
+                md.append(comment_block(c, i))
+
+        if not comments:
+            md.append("_No feedback has been submitted yet._\n")
+
+        md += [
+            "---",
+            f"_Generated by Entrext · {ts}_",
+        ]
+
+        content = "\n".join(md)
+        filename = f"entrext-{project.get('name','export').replace(' ','-').lower()}-{project_id[:8]}.md"
+        return Response(
+            content=content,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
-    except httpx.TimeoutException:
-        return HTMLResponse(PROXY_FAIL_HTML, headers={"X-Entrext-Status": "timeout"})
-    except HTTPException: raise
-    except Exception as e:
-        print(f"[PROXY] Error: {e}")
-        return HTMLResponse(PROXY_FAIL_HTML, headers={"X-Entrext-Status": "error"})
 
-# ─── AI Triage Engine (Groq Pipeline) ──────────────────────────────────────────
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-TRIAGE_SYSTEM = """You are a senior QA engineer. Analyze UI feedback comments and classify them into a structured triage report.
-Return ONLY valid JSON matching this exact schema, no markdown, no explanation:
-{
-  "severity": "P0|P1|P2|P3",
-  "category": "visual_bug|functional_bug|ux_issue|performance|accessibility|copy_error",
-  "ai_summary": "max 10 words describing the issue",
-  "suggested_fix": "one sentence describing how to fix it"
-}
-Severity guide:
-P0 = App-breaking, data loss, security issue, complete feature failure
-P1 = Major feature broken, significantly impacts user flow
-P2 = Minor bug, visual inconsistency, UX friction
-P3 = Cosmetic, copy error, micro-polish item"""
-
-async def triage_comment(comment_id: str, text: str, selector: str, project_id: str):
-    """Background task: calls Groq, classifies comment, updates DB, broadcasts via WS"""
-    if not GROQ_API_KEY:
-        print("[Triage] GROQ_API_KEY not set — skipping triage")
-        return
-
-    try:
-        user_prompt = f'Component: `{selector}`\nFeedback: "{text}"'
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                GROQ_URL,
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [
-                        {"role": "system", "content": TRIAGE_SYSTEM},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 200,
-                    "response_format": {"type": "json_object"}
+    # ─────────────────────────────────────────────────────────────────────────
+    # JSON
+    # ─────────────────────────────────────────────────────────────────────────
+    if format == "json":
+        import json as json_lib
+        payload = {
+            "meta": {
+                "exported_at":    ts,
+                "project_id":     project.get("id"),
+                "project_name":   project.get("name"),
+                "target_url":     project.get("target_url"),
+                "total_issues":   len(comments),
+                "open_issues":    len(open_issues),
+                "resolved_issues": len(resolved_issues),
+            },
+            "issues": [
+                {
+                    "id":                 c.get("id"),
+                    "number":             i + 1,
+                    "text":               c.get("text",""),
+                    "component_selector": c.get("component_selector",""),
+                    "xpath":              c.get("xpath",""),
+                    "tag_name":           c.get("tag_name",""),
+                    "inner_text":         c.get("inner_text",""),
+                    "page_url":           c.get("page_url",""),
+                    "tester_name":        c.get("tester_name","Anonymous"),
+                    "severity":           c.get("severity","P2"),
+                    "status":             c.get("status","open"),
+                    "x":                  c.get("x",0),
+                    "y":                  c.get("y",0),
+                    "marker_number":      c.get("marker_number",0),
+                    "screenshot_url":     c.get("screenshot_url"),
+                    "created_at":         c.get("created_at",""),
                 }
-            )
-        
-        if resp.status_code != 200:
-            print(f"[Triage] Groq error {resp.status_code}: {resp.text[:200]}")
-            return
+                for i, c in enumerate(comments)
+            ]
+        }
+        filename = f"entrext-{project_id[:8]}.json"
+        return Response(
+            content=json_lib.dumps(payload, indent=2, ensure_ascii=False),
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
 
-        raw = resp.json()["choices"][0]["message"]["content"].strip()
-        analysis = json.loads(raw)
-        
-        # Enforce valid fields
-        if analysis.get("severity") not in ("P0", "P1", "P2", "P3"): analysis["severity"] = "P2"
-        valid_cats = {"visual_bug","functional_bug","ux_issue","performance","accessibility","copy_error"}
-        if analysis.get("category") not in valid_cats: analysis["category"] = "ux_issue"
+    # ─────────────────────────────────────────────────────────────────────────
+    # CSV
+    # ─────────────────────────────────────────────────────────────────────────
+    if format == "csv":
+        import csv, io
+        buf = io.StringIO()
+        FIELDS = [
+            "number","text","component_selector","xpath","tag_name",
+            "inner_text","page_url","tester_name","severity",
+            "status","x","y","marker_number","created_at"
+        ]
+        writer = csv.DictWriter(buf, fieldnames=FIELDS, extrasaction='ignore')
+        writer.writeheader()
+        for i, c in enumerate(comments):
+            writer.writerow({
+                "number":             i + 1,
+                "text":               c.get("text",""),
+                "component_selector": c.get("component_selector",""),
+                "xpath":              c.get("xpath",""),
+                "tag_name":           c.get("tag_name",""),
+                "inner_text":         c.get("inner_text",""),
+                "page_url":           c.get("page_url",""),
+                "tester_name":        c.get("tester_name","Anonymous"),
+                "severity":           c.get("severity","P2"),
+                "status":             c.get("status","open"),
+                "x":                  c.get("x",0),
+                "y":                  c.get("y",0),
+                "marker_number":      c.get("marker_number",0),
+                "created_at":         (c.get("created_at",""))[:19],
+            })
+        filename = f"entrext-{project_id[:8]}.csv"
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
 
-        # Update DB with the intelligence
-        db.table("comments").update({
-            "severity": analysis["severity"],
-            "category": analysis["category"],
-            "ai_summary": analysis["ai_summary"],
-            "suggested_fix": analysis["suggested_fix"]
-        }).eq("id", comment_id).execute()
-
-        # Final broadcast push
-        await ws_manager.broadcast(project_id, {
-            "type": "COMMENT_TRIAGED",
-            "comment_id": comment_id,
-            "severity": analysis["severity"],
-            "category": analysis["category"],
-            "ai_summary": analysis["ai_summary"],
-            "suggested_fix": analysis["suggested_fix"]
-        })
-        print(f"[Triage] ✓ {comment_id} → {analysis['severity']} / {analysis['category']}")
-
-    except Exception as e:
-        print(f"[Triage] Pipeline failed for {comment_id}: {e}")
-
-# ─── WebSocket (Harden implementation in next step) ───────────────────────────
-@app.websocket("/ws/project/{project_id}")
-async def ws_endpoint(ws: WebSocket, project_id: str, tester_id: str = "", tester_name: str = "Anonymous"):
-    tid = tester_id or uuid.uuid4().hex
-    print(f"[WS_ATTEMPT] Project: {project_id} | Tester: {tester_name} ({tid})")
-    
-    try:
-        await ws_manager.connect(ws, project_id, tid, tester_name)
-        print(f"[WS_CONNECTED] {tid}")
-        
-        await ws_manager.broadcast(project_id, {"type": "TESTER_JOINED", "tester_id": tid, "name": tester_name}, exclude=tid)
-        await ws.send_json({"type": "SYNC", "testers": ws_manager.testers(project_id)})
-        
-        while True:
-            data = await ws.receive_json()
-            # Broadcast the cursor move or action
-            await ws_manager.broadcast(project_id, {**data, "tester_id": tid, "name": tester_name}, exclude=tid)
-    except WebSocketDisconnect:
-        ws_manager.disconnect(project_id, tid)
-        await ws_manager.broadcast(project_id, {"type": "TESTER_LEFT", "tester_id": tid, "name": tester_name})
-    except Exception as e:
-        ws_manager.disconnect(project_id, tid)
-        print(f"[WS] Error: {e}")
+    raise AppError("INVALID_FORMAT", "format must be markdown, json, or csv", 400)

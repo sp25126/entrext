@@ -1,0 +1,57 @@
+# Entrext: Final Production QA Matrix (V7)
+
+## Phase 1: Dashboard UI & Project Core
+
+| Test ID | Action | Expected UI State | Failure Indicator |
+| :--- | :--- | :--- | :--- |
+| P1-01 | Visit `/dashboard` | Page loads immediately without redirect since auth is removed. | Redirects to /login or shows 401. |
+| P1-02 | View empty dashboard | Polished "No projects yet" state appears with "Create First Project" CTA. | Shows blank white screen or 404. |
+| P1-03 | Click "New Project" | Slide-over panel opens with smooth 0.3s spring animation. | Panel pops in instantly without transition. |
+| P1-04 | Submit empty project name | Red text "Project name is required" appears under input. | Form submits or page reloads. |
+| P1-05 | Submit invalid URL | Error message "Please enter a valid URL (http/https)" appears. | "Create" button proceeds. |
+| P1-06 | Submit valid project | Button turns to "Creating..." with spinner; panel slides out. | Panel stays open despite success. |
+| P1-07 | Success Redirect | Dashboard automatically navigates to `/project/[id]`. | Stays on dashboard after success notification. |
+| P1-08 | Dashboard Hydration | Project card shows favicon, domain name, and "0 Comments" badge. | "Dummy Project" or "Loading..." persists. |
+| P1-09 | Health Sparkline | Placeholder sparkline renders in lower-right of the card in gray. | Sparkline area is empty. |
+| P1-10 | Delete Project | Clicking delete opens "Are you sure?" confirmation modal. | Project deletes instantly without warning. |
+
+## Phase 3: Sharing & Tester Onboarding
+
+| Test ID | Action | Expected UI State | Failure Indicator |
+| :--- | :--- | :--- | :--- |
+| P3-01 | Open Share Panel | Panel slides in from right; background dims slightly. | Overlay doesn't dim; panel jumps. |
+| P3-02 | Create 'Reviewer' Link | Selecting role + Submit shows "Generating link..." spinner. | List doesn't update immediately. |
+| P3-03 | Copy Share Link | Icon changes to green checkmark ✓ for 2.0 seconds precisely. | Toast appears but icon stays the same. |
+| P3-04 | Visit Invalid Token `/t/null` | Full-screen "Link Revoked" UI with red Alert icon appears. | Shows broken dashboard shell. |
+| P3-05 | Visit Valid Token `/t/[uuid]` | Renders project name and "Identify Yourself" name input. | Dashboard loads without name prompt. |
+| P3-06 | Start without Name | "Initialize Audit" button is greyed out and non-clickable. | Session starts with empty/anonymous name. |
+| P3-07 | Initialize Audit | Page transitions to the Project View; name is saved in storage. | Redirects back to dashboard instead of project. |
+| P3-08 | Role Const: Viewer | Command center hides the "Add Comment" button and Resolvers. | Viewer can still interact with markers. |
+| P3-09 | Role Const: Reviewer | Command center shows "Resolve Issue" buttons on all markers. | Resolve buttons are hidden. |
+
+## Phase 4: Overlay & Core Loop (Critical)
+
+| Test ID | Action | Expected UI State | Failure Indicator |
+| :--- | :--- | :--- | :--- |
+| P4-01 | Iframe Loading State | Shows "Verifying Audit Tunnel..." spinner over the iframe area. | Shows white frame until target loads. |
+| P4-02 | Advanced Site Fallback | If target blocks frame, "Audit Tunnel Restricted" card renders. | Iframe shows "Refused to connect" browser error. |
+| P4-03 | Ctrl-Key Badge | Holding Ctrl shows the persistent cursor badge with project name. | Badge only appears on hover. |
+| P4-04 | Hover Outline | Hovering iframe elements with Ctrl shows purple dashed border. | Border color is solid blue or invisible. |
+| P4-05 | Drop Marker | Ctrl-Clicking immediately drops a white "Pending" number orb. | Orb appears with delay or has no number. |
+| P4-06 | Command Center Focus | Dropping marker auto-opens Sidebar and focuses textarea. | Sidebar remains closed. |
+| P4-07 | Optimistic Submit | Submitting turns white marker instantly into purple "Saved" orb. | Marker stays white for >1 second. |
+| P4-08 | DB Failure State | (Simulate 500) Marker turns red; "Retry" icon appears in sidebar. | Marker disappears entirely. |
+| P4-09 | Rapid Submission | Clicking "Send" 5x in 1s only creates 1 comment/marker. | 5 duplicate markers appear at same spot. |
+| P4-10 | Marker Animation | Hovering a card in sidebar makes the orb on iframe pulse. | No visual link between card and marker. |
+
+## Phase 5: Realtime & Export
+
+| Test ID | Action | Expected UI State | Failure Indicator |
+| :--- | :--- | :--- | :--- |
+| P5-01 | Remote Marker Add | User A drops marker. User B seesorb appear instantly. | User B must refresh to see new marker. |
+| P5-02 | Resolve Animation | Clicking resolve fades card to 50%; marker turns gray/dimmed. | Activity not reflected on the iframe orb. |
+| P5-03 | Export Dropdown | "Generating..." state shows on the specific format selected. | Whole menu freezes during generation. |
+| P5-04 | Markdown Download | Browser triggers `.md` file download with project name. | New tab opens instead of download. |
+| P5-05 | GitHub Integration | Success text "Pushed to github.com/user/repo" appears. | Spinner runs infinitely. |
+| P5-06 | Component Crash | ErrorBoundary shows "Audit Engine Interrupted" inside the panel. | Entire browser tab goes white. |
+| P5-07 | Base Recovery | Clicking "Return to Base" routes correctly to `/dashboard`. | Stays on crashed screen. |

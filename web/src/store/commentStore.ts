@@ -1,155 +1,144 @@
+// src/store/commentStore.ts
 import { create } from 'zustand'
-import { api } from '@/lib/api'
+import { api, Comment, CommentCreate } from '@/lib/api'
 
-export interface Comment {
-  id: string
-  project_id: string
-  text: string
-  component_selector: string
-  page_url?: string
-  tester_name: string
-  screenshot_url?: string
-  severity?: 'P0' | 'P1' | 'P2' | 'P3'
-  x: number
-  y: number
-  status: 'open' | 'resolved'
-  created_at: string
+interface CommentState {
+  comments:     Comment[]
+  loading:      boolean
+  error:        string | null
+  // Actions
+  loadComments:   (projectId: string) => Promise<void>
+  addComment:     (data: CommentCreate) => Promise<Comment>
+  resolveComment: (id: string) => Promise<void>
+  deleteComment:  (id: string) => Promise<void>
+  // Called by WebSocket
+  addCommentFromWS:  (c: Comment) => void
+  updateSeverity:    (id: string, severity: string) => void
+  updateStatus:      (id: string, status: 'open' | 'resolved') => void
+  updateTriage:      (id: string, triage: Partial<Comment>) => void
+  clearError:        () => void
 }
 
-interface CommentStore {
-  comments: Comment[]
-  isLoading: boolean
-  error: any | null
-  fetchComments: (projectId: string) => Promise<void>
-  addComment: (payload: {
-    project_id: string
-    text: string
-    component_selector: string
-    page_url: string
-    tester_name: string
-    screenshot_url: string
-    x: number
-    y: number
-    markerId: string        // for confirming the overlay marker
-  }) => Promise<void>
-  resolveComment: (commentId: string) => Promise<void>
-  updateTriage: (commentId: string, triage: Partial<Comment>) => void
-  addFromRemote: (comment: Comment) => void
-  retryComment: (tempId: string) => Promise<void>
-  submitting: Set<string>
-}
-
-export const useCommentStore = create<CommentStore>((set, get) => ({
+export const useCommentStore = create<CommentState>((set, get) => ({
   comments: [],
-  isLoading: false,
-  error: null,
-  submitting: new Set(),
-  
-  updateTriage: (commentId, triage) => set(state => ({
-    comments: state.comments.map(c => c.id === commentId ? { ...c, ...triage } : c)
-  })),
+  loading:  false,
+  error:    null,
 
-  addFromRemote: (comment) => set(state => {
-    // Don't add duplicates (might already be added via optimistic update)
-    if (state.comments.find(c => c.id === comment.id)) return state
-    return { comments: [...state.comments, comment] }
-  }),
-  
-  fetchComments: async (projectId) => {
-    set({ isLoading: true, error: null })
+  clearError: () => set({ error: null }),
+
+  loadComments: async (projectId) => {
+    set({ loading: true, error: null })
     try {
-      const data = await api.getComments(projectId) as Comment[]
-      set({ comments: data })
-    } catch (err: any) {
-      set({ error: err })
-    } finally {
-      set({ isLoading: false })
+      const comments = await api.comments.list(projectId)
+      set({ comments, loading: false })
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to load comments'
+      set({ loading: false, error: msg })
     }
   },
-  
-  addComment: async (payload) => {
-    const { submitting } = get()
-    if (submitting.has(payload.markerId)) {
-      console.warn('[Entrext] Duplicate submission blocked')
-      return
-    }
 
-    set(state => ({ submitting: new Set([...state.submitting, payload.markerId]) }))
-    const { markerId, ...body } = payload
-    
-    // Optimistic: add immediately with temp id
-    const tempId = markerId // Using markerId as tempId for retry context
+  addComment: async (data) => {
+    // Optimistic update — add pending comment immediately
+    const optimisticId = `pending-${Date.now()}`
     const optimistic: Comment = {
-      id: tempId, 
-      status: 'open', 
-      created_at: new Date().toISOString(), 
-      ...body
+      id:                 optimisticId,
+      project_id:         data.project_id,
+      text:               data.text,
+      component_selector: data.component_selector ?? '',
+      xpath:              data.xpath ?? '',
+      tag_name:           data.tag_name ?? '',
+      inner_text:         data.inner_text ?? '',
+      page_url:           data.page_url ?? '/',
+      tester_name:        data.tester_name ?? 'Anonymous',
+      severity:           null,
+      status:             'open',
+      x:                  data.x ?? 0,
+      y:                  data.y ?? 0,
+      marker_number:      data.marker_number ?? 0,
+      screenshot_url:     data.screenshot_url ?? null,
+      created_at:         new Date().toISOString(),
     }
-    
-    set(state => ({ comments: [...state.comments, optimistic] }))
-    
+
+    set(s => ({ comments: [...s.comments, optimistic] }))
+
     try {
-      const saved = await api.createComment(body) as Comment
-      
-      // Replace temp with real
-      set(state => ({
-        comments: state.comments.map(c => c.id === tempId ? saved : c)
+      const saved = await api.comments.create(data)
+      // Replace optimistic with real DB record
+      set(s => ({
+        comments: s.comments.map(c => c.id === optimisticId ? saved : c),
+        error: null,
       }))
-      
-      // Confirm the marker turns purple/saved
-      const { useOverlayStore } = await import('./overlayStore')
-      useOverlayStore.getState().confirmMarker(markerId)
-      
-    } catch (err: any) {
-      console.error('Failed to save comment:', err)
-      
-      // Mark as failed — keep it visible so user can retry
-      set(state => ({
-        comments: state.comments.map(c => c.id === tempId ? { ...c, status: 'failed' as any } : c)
+      return saved
+    } catch (err: unknown) {
+      // Remove optimistic on failure
+      set(s => ({
+        comments: s.comments.filter(c => c.id !== optimisticId),
+        error:    err instanceof Error ? err.message : 'Could not save comment',
       }))
-      
-      const { useOverlayStore } = await import('./overlayStore')
-      const os = useOverlayStore.getState()
-      if (os.failMarker) os.failMarker(markerId)
-    } finally {
-      set(state => {
-        const next = new Set(state.submitting)
-        next.delete(payload.markerId)
-        return { submitting: next }
-      })
+      throw err   // Re-throw so CommandCenter can show retry UI
     }
   },
 
-  retryComment: async (tempId: string) => {
-    const comment = get().comments.find(c => c.id === tempId)
-    if (!comment) return
-
-    set(state => ({
-      comments: state.comments.map(c => c.id === tempId ? { ...c, status: 'saving' as any } : c)
+  resolveComment: async (id) => {
+    // Optimistic
+    set(s => ({
+      comments: s.comments.map(c =>
+        c.id === id ? { ...c, status: 'resolved' as const } : c
+      )
     }))
-
     try {
-      const { markerId, status, id, ...body } = comment as any
-      const saved = await api.createComment(body) as Comment
-      set(state => ({
-        comments: state.comments.map(c => c.id === tempId ? saved : c)
+      await api.comments.resolve(id)
+    } catch (err: unknown) {
+      // Rollback
+      set(s => ({
+        comments: s.comments.map(c =>
+          c.id === id ? { ...c, status: 'open' as const } : c
+        ),
+        error: err instanceof Error ? err.message : 'Could not resolve comment',
       }))
+    }
+  },
+
+  deleteComment: async (id) => {
+    const prev = get().comments
+    set(s => ({ comments: s.comments.filter(c => c.id !== id) }))
+    try {
+      await api.comments.delete(id)
     } catch {
-      set(state => ({
-        comments: state.comments.map(c => c.id === tempId ? { ...c, status: 'failed' as any } : c)
-      }))
+      set({ comments: prev, error: 'Could not delete comment' })
     }
   },
-  
-  resolveComment: async (commentId) => {
-    set(state => ({
-      comments: state.comments.map(c => c.id === commentId ? { ...c, status: 'resolved' } : c)
+
+  // ── WebSocket handlers ───────────────────────────────────────────────────
+  addCommentFromWS: (c) => {
+    set(s => {
+      // Prevent duplicate if we already have it (e.g. from our own submission)
+      if (s.comments.some(x => x.id === c.id)) return s
+      return { comments: [...s.comments, c] }
+    })
+  },
+
+  updateSeverity: (id, severity) => {
+    set(s => ({
+      comments: s.comments.map(c =>
+        c.id === id ? { ...c, severity: severity as Comment['severity'] } : c
+      )
     }))
-    try {
-      await api.resolveComment(commentId)
-    } catch (err: any) {
-      console.error('Failed to resolve comment:', err)
-      // Rollback or handle error
-    }
+  },
+
+  updateTriage: (id, triage) => {
+    set(s => ({
+      comments: s.comments.map(c =>
+        c.id === id ? { ...c, ...triage } : c
+      )
+    }))
+  },
+
+  updateStatus: (id, status) => {
+    set(s => ({
+      comments: s.comments.map(c =>
+        c.id === id ? { ...c, status } : c
+      )
+    }))
   },
 }))

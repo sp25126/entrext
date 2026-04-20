@@ -1,97 +1,145 @@
-import { useEffect, useRef, useCallback } from 'react'
+import { useEffect, useRef, useCallback, useState } from 'react'
 import { useCommentStore } from '@/store/commentStore'
-import { useOverlayStore } from '@/store/overlayStore'
-import { useRealtimeStore } from '@/store/realtimeStore'
 
-const WS_BASE = process.env.NEXT_PUBLIC_API_BASE?.replace('http', 'ws') ?? 'ws://localhost:8765'
+const WS_BASE = process.env.NEXT_PUBLIC_WS_BASE?.replace(/\/$/, '')
+  || 'ws://localhost:8765'
 
-export function useRealtimeSync(projectId: string) {
+const MAX_RETRIES = 4
+const BACKOFF_BASE_MS = 1500   // 1.5s, 3s, 6s, 12s
+
+interface RealtimeSyncOptions {
+  projectId: string
+  onMessage: (payload: unknown) => void
+  enabled?: boolean
+}
+
+export function useRealtimeSync({ projectId, onMessage, enabled = true }: RealtimeSyncOptions) {
+  const [connected, setConnected] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout>>()
-  const isManualClose = useRef(false)
-  
-  const { setConnected, updateCursor } = useRealtimeStore()
+  const retryRef = useRef(0)
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const unmountedRef = useRef(false)
+
+  const cleanup = useCallback(() => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    if (wsRef.current) {
+      // Remove all handlers first to prevent onclose re-triggering connect()
+      wsRef.current.onopen = null
+      wsRef.current.onmessage = null
+      wsRef.current.onerror = null
+      wsRef.current.onclose = null
+      if (wsRef.current.readyState <= WebSocket.OPEN) {
+        wsRef.current.close(1000, 'cleanup')
+      }
+      wsRef.current = null
+    }
+  }, [])
 
   const connect = useCallback(() => {
-    if (!projectId) return
+    if (unmountedRef.current) return
+    if (!enabled || !projectId) return
 
-    const tester_id = localStorage.getItem('tester_id') ?? crypto.randomUUID()
-    localStorage.setItem('tester_id', tester_id)
-    const tester_name = localStorage.getItem('tester_name') ?? 'Anonymous'
+    // Validate UUID format before connecting — prevents 4000 closes
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    if (!uuidRegex.test(projectId)) {
+      console.warn('[Entrext WS] Invalid projectId format — WebSocket skipped:', projectId)
+      return
+    }
 
-    const url = `${WS_BASE}/ws/project/${projectId}?tester_id=${tester_id}&tester_name=${encodeURIComponent(tester_name)}`
-    
-    console.log(`[Entrext WS] Connecting to ${url}...`)
-    const ws = new WebSocket(url)
+    // Don't open a second socket if one is already open/connecting
+    if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) return
+
+    const url = `${WS_BASE}/ws/${projectId}`
+    console.log(`[Entrext WS] Connecting → ${url} (attempt ${retryRef.current + 1})`)
+
+    let ws: WebSocket
+    try {
+      ws = new WebSocket(url)
+    } catch (err) {
+      // This only throws on completely invalid URLs, not connection failures
+      console.error('[Entrext WS] Invalid WebSocket URL:', url, err)
+      return
+    }
+
     wsRef.current = ws
 
     ws.onopen = () => {
-      console.log('[Entrext WS] Connected ✓')
+      if (unmountedRef.current) { ws.close(1000); return }
+      console.log('[Entrext WS] ✓ Connected to project:', projectId)
+      retryRef.current = 0
       setConnected(true)
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
     }
 
-    ws.onmessage = (event) => {
+    ws.onmessage = (event: MessageEvent) => {
       try {
-        const msg = JSON.parse(event.data)
-        
-        switch (msg.type) {
-          case 'COMMENT_TRIAGED':
-            console.log('[Entrext WS] Intelligence Received:', msg)
-            useCommentStore.getState().updateTriage(msg.comment_id, {
-              severity: msg.severity,
-              category: msg.category,
-              ai_summary: msg.ai_summary,
-              suggested_fix: msg.suggested_fix,
-            })
-            break
-            
-          case 'MARKER_PLACED':
-            useOverlayStore.getState().addMarker(msg.marker)
-            break
-            
-          case 'COMMENT_SAVED':
-            useCommentStore.getState().addFromRemote(msg.comment)
-            break
+        const payload = JSON.parse(event.data as string)
+        console.log('[Entrext WS] Recv:', payload.type)
 
-          case 'CURSOR_MOVE':
-            updateCursor(msg.tester_id, msg.x, msg.y, msg.name || msg.tester_name)
+        // Route message types to the correct store actions
+        switch (payload.type) {
+          case 'NEW_COMMENT':
+            useCommentStore.getState().addCommentFromWS(payload.comment)
             break
-            
-          case 'PING':
-            wsRef.current?.send(JSON.stringify({ type: 'PONG', ts: msg.ts }))
+          case 'COMMENT_TRIAGED':
+            useCommentStore.getState().updateSeverity(payload.comment_id, payload.severity)
             break
+          case 'COMMENT_RESOLVED':
+            useCommentStore.getState().updateStatus(payload.comment_id, 'resolved')
+            break
+          default:
+            // Fallback for generic untyped messages or other modules
+            if (onMessage) onMessage(payload)
+            else console.warn('[Entrext WS] Unknown message type:', payload.type)
         }
-      } catch (err) {
-         /* malformed message — ignore */ 
+      } catch {
+        console.warn('[Entrext WS] Unparseable message — ignored')
       }
     }
 
-    ws.onclose = (event) => {
-      setConnected(false)
-      if (isManualClose.current) return
-      
-      console.log(`[Entrext WS] Disconnected (${event.code}) — reconnecting in 3s`)
-      // Exponential backoff or simple fixed interval for MVP
-      reconnectTimer.current = setTimeout(connect, 3000)
+    ws.onerror = () => {
+      // onerror NEVER has useful details in the browser — that's the spec.
+      // onclose fires immediately after with the close code — handle retry there.
+      console.warn(`[Entrext WS] Socket error on project ${projectId} — waiting for close event`)
     }
 
-    ws.onerror = (err) => {
-      console.error('[Entrext WS] Connection Error:', err)
-      ws.close() // triggers onclose → reconnect
+    ws.onclose = (event: CloseEvent) => {
+      if (unmountedRef.current) return
+      setConnected(false)
+      wsRef.current = null
+
+      const cleanClose = event.code === 1000 || event.code === 1001
+      const serverRejected = event.code === 4000  // our custom "invalid project" code
+      const retriesLeft = retryRef.current < MAX_RETRIES
+
+      if (cleanClose || serverRejected || !retriesLeft) {
+        if (serverRejected) console.warn('[Entrext WS] Server rejected connection (invalid project ID?)')
+        if (!retriesLeft) console.error('[Entrext WS] Max retries reached — realtime sync disabled until reload')
+        return
+      }
+
+      const delay = BACKOFF_BASE_MS * Math.pow(2, retryRef.current)
+      retryRef.current++
+      console.log(`[Entrext WS] Reconnecting in ${delay}ms (attempt ${retryRef.current}/${MAX_RETRIES})...`)
+      timeoutRef.current = setTimeout(connect, delay)
     }
-  }, [projectId, setConnected, updateCursor])
+  }, [projectId, enabled, onMessage])
 
   useEffect(() => {
-    isManualClose.current = false
+    unmountedRef.current = false
     connect()
-    
     return () => {
-      isManualClose.current = true
-      wsRef.current?.close()
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+      unmountedRef.current = true
+      cleanup()
     }
-  }, [connect])
+  }, [connect, cleanup])
 
-  return wsRef
+  const send = useCallback((data: unknown) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(data))
+    } else {
+      console.warn('[Entrext WS] Cannot send — socket not open')
+    }
+  }, [])
+
+  return { connected, send }
 }

@@ -6,6 +6,10 @@ export interface Marker {
   x: number        // percentage of iframe width
   y: number        // percentage of iframe height
   selector: string
+  xpath?: string
+  tagName?: string
+  innerText?: string
+  pageUrl?: string
   elementLabel: string
   screenshot: string | null
   status: 'pending' | 'saved' | 'failed'

@@ -42,7 +42,7 @@ export default function CommentSidebar({
     
     comments.forEach((c, i) => {
       md += `### Issue #${i + 1}: ${c.text.split('\n')[0]}\n`
-      md += `- **Author**: ${c.author_name || 'Anonymous'}\n`
+      md += `- **Author**: ${c.author_name || 'N/A'}\n`
       md += `- **Component**: \`${c.component_ref?.selector || 'N/A'}\`\n`
       md += `- **Position**: X: ${c.component_ref?.x.toFixed(1)}%, Y: ${c.component_ref?.y.toFixed(1)}%\n`
       md += `- **Timestamp**: ${new Date(c.created_at).toLocaleString()}\n`
@@ -57,7 +57,7 @@ export default function CommentSidebar({
     if (isTester && testerName.trim()) {
       localStorage.setItem('entrext_tester_name', testerName)
     }
-    onAddComment(commentText, testerName || 'Anonymous')
+    onAddComment(commentText, testerName)
     setCommentText('')
   }
 
@@ -111,7 +111,7 @@ export default function CommentSidebar({
                       <span className="text-[10px] font-black text-purple-400">{idx + 1}</span>
                    </div>
                    <span className="text-[10px] font-black uppercase tracking-widest text-white/60">
-                      {comment.author_name || 'Anonymous User'}
+                      {comment.author_name || 'User'}
                    </span>
                 </div>
                 <span className="text-[9px] text-white/20 font-bold flex items-center gap-1">
@@ -195,7 +195,7 @@ export default function CommentSidebar({
                   <div className="absolute bottom-3 right-3">
                     <Button 
                       onClick={handlePostComment}
-                      disabled={!commentText.trim()}
+                      disabled={!commentText.trim() || (isTester && !testerName.trim())}
                       className="rounded-full w-10 h-10 p-0 shadow-2xl bg-purple-600 hover:bg-purple-500"
                     >
                       <Send className="w-4 h-4" />

@@ -1,67 +1,58 @@
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from .logger import logger
 import traceback
-import logging
-from datetime import datetime, timezone
-
-# ─── Structured Logger ────────────────────────────────────────────────────────
-# This produces semi-structured logs that are easy to parse by log aggregators
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
-)
-logger = logging.getLogger("entrext")
 
 class AppError(Exception):
-    """
-    Base class for all business logic errors.
-    Errors here are intended to be seen by the client.
-    """
-    def __init__(self, code: str, message: str, status: int = 400):
+    def __init__(self, code: str, message: str, status_code: int = 400):
         self.code = code
         self.message = message
-        self.status = status
-        super().__init__(message)
+        self.status_code = status_code
 
-# ─── Exception Handlers ───────────────────────────────────────────────────────
+# Internal helper to ensure CORS headers are present on error responses
+def get_error_headers(request: Request):
+    origin = request.headers.get("origin")
+    return {
+        "Access-Control-Allow-Origin": origin if origin else "*",
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*"
+    }
 
 async def app_error_handler(request: Request, exc: AppError):
-    """Handles intentional application errors"""
-    logger.warning(f"AppError [{exc.code}] {exc.message} — {request.method} {request.url.path}")
     return JSONResponse(
-        status_code=exc.status,
+        status_code=exc.status_code,
+        headers=get_error_headers(request),
         content={"error": exc.code, "message": exc.message}
     )
 
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    """Handles Pydantic validation failures"""
     errors = []
     for err in exc.errors():
-        # Clean up the location path for readability
-        field = " → ".join(str(l) for l in err["loc"] if l != "body")
-        errors.append({"field": field, "issue": err["msg"]})
+        loc = " -> ".join([str(l) for l in err["loc"] if l != "body"])
+        errors.append({"field": loc or "payload", "issue": err["msg"]})
     
-    logger.info(f"Validation failure on {request.url.path}: {errors}")
     return JSONResponse(
         status_code=422,
-        content={"error": "VALIDATION_ERROR", "fields": errors}
+        headers=get_error_headers(request),
+        content={
+            "error": "VALIDATION_FAILED",
+            "message": "The provided data is invalid.",
+            "fields": errors
+        }
     )
 
-async def unhandled_error_handler(request: Request, exc: Exception):
-    """
-    Catches everything else.
-    Logs the full traceback but returns a generic error to the client.
-    """
-    logger.error(
-        f"Unhandled exception: {type(exc).__name__}: {exc}\n"
-        f"Path: {request.method} {request.url.path}\n"
-        f"{traceback.format_exc()}"
-    )
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Log the full traceback internally for debugging
+    logger.error(f"Unhandled Exception: {str(exc)}\n{traceback.format_exc()}")
+    
+    # Return a generic error to the client with explicit CORS headers
     return JSONResponse(
         status_code=500,
+        headers=get_error_headers(request),
         content={
-            "error": "INTERNAL_ERROR", 
-            "message": "An unexpected error occurred. Our engineers have been notified."
+            "error": "INTERNAL_ERROR",
+            "message": "An unexpected server error occurred."
         }
     )

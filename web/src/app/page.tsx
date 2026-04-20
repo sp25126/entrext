@@ -91,9 +91,9 @@ export default function Home() {
           <span className="font-black text-2xl tracking-tighter text-white">Entrext</span>
         </div>
         <div className="hidden lg:flex gap-10 text-[11px] font-bold uppercase tracking-[0.2em] text-white/40">
-          <span className="hover:text-white cursor-pointer transition-colors">Framework</span>
-          <span className="hover:text-white cursor-pointer transition-colors">Resilience</span>
-          <span className="hover:text-white cursor-pointer transition-colors">Pricing</span>
+          <Link href="/dashboard" className="hover:text-white cursor-pointer transition-colors">Framework</Link>
+          <Link href="/dashboard" className="hover:text-white cursor-pointer transition-colors">Resilience</Link>
+          <Link href="/pricing" className="hover:text-white cursor-pointer transition-colors">Pricing</Link>
         </div>
         <div className="flex items-center gap-4">
              <Link 

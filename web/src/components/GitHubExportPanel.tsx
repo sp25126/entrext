@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { Github, Save, Send, CheckCircle2, AlertTriangle, ExternalLink } from 'lucide-react'
+import { Code, Save, Send, CheckCircle2, AlertTriangle, ExternalLink } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
 export function GitHubExportPanel({ projectId }: { projectId: string }) {
@@ -45,7 +45,7 @@ export function GitHubExportPanel({ projectId }: { projectId: string }) {
     <div className="p-6 space-y-6 bg-white/[0.02] border-t border-white/[0.03]">
       <div className="flex items-center gap-3">
         <div className="w-8 h-8 rounded-xl bg-purple-500/10 flex items-center justify-center">
-          <Github className="w-4 h-4 text-purple-400" />
+          <Code className="w-4 h-4 text-purple-400" />
         </div>
         <div>
           <h3 className="text-white font-black text-[10px] tracking-widest uppercase">GitHub Sync Substrate</h3>
