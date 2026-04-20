@@ -100,18 +100,8 @@ npm run dev
 
 ---
 
-## ⚡ The Director's Prompt (For AI Developers)
+## ⚡ AI Developer Hand-off
 
-If you are handing this project over to an AI agent (like Antigravity or similar), paste the following prompt to context-load it immediately:
+If you are handing this project over to an AI agent (like Antigravity, Cursor, or Devin), simply provide them with the `prompt.md` file located in the root of this repository.
 
-> **PROMPT:**
-> "I am working on Entrext, an 'indestructible' feedback engine for web auditing. The tech stack is Next.js (Turbo), FastAPI, and Supabase. The core innovation is a **Header-Driven Proxy Detection system** (see `backend/main.py`) that handles WebGL/3D site fallback via a status-signaling engine.
-> 
-> Key Architectural Points:
-> - **State Management**: Zustand stores are located in `web/src/store/`. Realtime peer cursors are orchestrated via WebSockets in `page.tsx`.
-> - **Proxy Engine**: The `/proxy` endpoint in `main.py` rewrites assets and injects `overlay.js` while scanning for Three.js/Spline to set the `X-Entrext-Status` header.
-> - **Selector Logic**: `web/public/overlay.js` uses a defensive, attribute-first algorithm (avoiding `dataset`) to ensure SVGs and Shadow DOM elements don't crash the engine.
-> 
-> My goal is to maintain the 'Indestructible MVP' philosophy: focus on technical resilience, premium design aesthetics, and a crash-proof audit tunnel. Please audit the repository structure and proceed based on my next request."
-
----
+That file contains the full architectural context, schema definitions, and sequence instructions required for an AI to boot the project autonomously.

@@ -134,6 +134,12 @@ Entrext Platform (web)           Entrext Lens (extension)
 
 ---
 
+## 🤖 AI Builder Handoff
+
+Are you an AI (Cursor, Devin, Antigravity) reading this repository? Stop guessing the architecture.
+
+Read the **`prompt.md`** file located in the root directory. It contains the exact SQL schema, relative import rules, and step-by-step launch sequence you need to boot this project successfully.
+
 ## License
 
 MIT — build freely, ship fast.
